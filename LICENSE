@@ -1,0 +1,40 @@
+GNU GENERAL PUBLIC LICENSE
+Version 2, June 1991
+
+Copyright (C) 1989, 1991 Free Software Foundation, Inc.
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+
+Everyone is permitted to copy and distribute verbatim copies
+of this license document, but changing it is not allowed.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+---
+
+Third-Party Notices:
+- src/opl/dbopl.h, src/opl/dbopl.cpp: YM3812/YMF262 OPL2/OPL3 emulator from
+  DOSBox 0.74-3, Copyright (C) 2002-2019 The DOSBox Team, licensed under
+  GPL-2.0-or-later.
+- Links against (dynamically by default; statically with SAN4_STATIC=ON, see
+  THIRD_PARTY_NOTICES.md):
+  - libx86emu (HPND-sell-variant X11-style permissive license, Copyright (C)
+    SciTech Software / David Mosberger-Tang / Egbert Eich / SUSE LINUX GmbH)
+  - SDL2 (zlib license, Copyright (C) Sam Lantinga)
+  - libpng (libpng license)
+  - zlib (zlib license, Copyright (C) Jean-loup Gailly and Mark Adler)
+
+Disclaimer:
+This project is an independent clean-room compatibility runtime and contains
+zero proprietary game executables, fonts, audio, graphics, or data files.
+Users must supply their own legally owned copy of the original DOS game.

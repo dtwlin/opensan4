@@ -1,0 +1,32 @@
+#include <winver.h>
+
+1 24 "san4.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "OpenSan4 Contributors\0"
+      VALUE "FileDescription",  "OpenSan4 Clean-Room HD Asset Pack Generator (BYOG)\0"
+      VALUE "FileVersion",      "1.0.0.0\0"
+      VALUE "InternalName",     "san4-hdpack-gen\0"
+      VALUE "LegalCopyright",   "GPL-2.0-or-later\0"
+      VALUE "OriginalFilename", "san4-hdpack-gen.exe\0"
+      VALUE "ProductName",      "OpenSan4\0"
+      VALUE "ProductVersion",   "1.0.0.0\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

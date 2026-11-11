@@ -1,0 +1,156 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "clang-lto",
+      "displayName": "Clang Release + Full LTO",
+      "description": "Builds san4-linux with auto-detected Clang and Full Link-Time Optimization",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SAN4_USE_CLANG": "ON",
+        "SAN4_ENABLE_LTO": "ON",
+        "SAN4_LTO_MODE": "FULL",
+        "SAN4_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "clang-thinlto",
+      "displayName": "Clang Release + ThinLTO",
+      "description": "Builds san4-linux with auto-detected Clang and parallel ThinLTO",
+      "binaryDir": "${sourceDir}/build-thinlto",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SAN4_USE_CLANG": "ON",
+        "SAN4_ENABLE_LTO": "ON",
+        "SAN4_LTO_MODE": "THIN",
+        "SAN4_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "clang-lto-bolt-relocs",
+      "displayName": "Clang Release + Full LTO + BOLT Relocations",
+      "description": "Builds san4-linux with Clang Full LTO and linker relocations (-Wl,--emit-relocs) for llvm-bolt",
+      "binaryDir": "${sourceDir}/build-bolt",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SAN4_USE_CLANG": "ON",
+        "SAN4_ENABLE_LTO": "ON",
+        "SAN4_LTO_MODE": "FULL",
+        "SAN4_BOLT_RELOCS": "ON",
+        "SAN4_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "gcc-release",
+      "displayName": "GCC Release (Non-LTO)",
+      "description": "Standard system compiler Release build without LTO",
+      "binaryDir": "${sourceDir}/build-gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SAN4_USE_CLANG": "OFF",
+        "SAN4_ENABLE_LTO": "OFF",
+        "SAN4_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "ci-asan",
+      "displayName": "CI Synthetic ASan + UBSan",
+      "description": "Engine and synthetic conformance suite with AddressSanitizer + UBSan (no game files required)",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "SAN4_CI_NO_GAME": "ON",
+        "SAN4_ENABLE_SANITIZERS": "ON",
+        "SAN4_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "ci-tsan",
+      "displayName": "CI Synthetic TSan",
+      "description": "Engine and synthetic conformance suite with ThreadSanitizer (no game files required)",
+      "binaryDir": "${sourceDir}/build-tsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "SAN4_CI_NO_GAME": "ON",
+        "SAN4_ENABLE_TSAN": "ON",
+        "SAN4_WARNINGS_AS_ERRORS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "clang-lto",
+      "configurePreset": "clang-lto"
+    },
+    {
+      "name": "clang-thinlto",
+      "configurePreset": "clang-thinlto"
+    },
+    {
+      "name": "clang-lto-bolt-relocs",
+      "configurePreset": "clang-lto-bolt-relocs"
+    },
+    {
+      "name": "gcc-release",
+      "configurePreset": "gcc-release"
+    },
+    {
+      "name": "ci-asan",
+      "configurePreset": "ci-asan"
+    },
+    {
+      "name": "ci-tsan",
+      "configurePreset": "ci-tsan"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "clang-lto",
+      "configurePreset": "clang-lto",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "clang-thinlto",
+      "configurePreset": "clang-thinlto",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "clang-lto-bolt-relocs",
+      "configurePreset": "clang-lto-bolt-relocs",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "gcc-release",
+      "configurePreset": "gcc-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ci-asan",
+      "configurePreset": "ci-asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ci-tsan",
+      "configurePreset": "ci-tsan",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# ThreadSanitizer suppressions for third-party libraries (not san4 code).
+# libdbus takes its internal locks in different orders during SDL video
+# init/quit (SDL_DBus_Init / SDL_DBus_Quit), which TSan reports as a
+# potential lock-order inversion inside libdbus itself.
+deadlock:libdbus-1.so

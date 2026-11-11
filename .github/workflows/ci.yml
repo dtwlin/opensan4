@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libsdl2-dev libx86emu-dev libpng-dev
+      - name: Verify clean repository hygiene
+        run: ./scripts/check_clean_repo.sh
+      - name: Verify BYOG CMake gate rejects missing game directory
+        run: |
+          if cmake -S . -B build-missing-check >/dev/null 2>&1; then
+            echo "Expected CMake configure without SAN4_GAME_DIR to fail" >&2
+            exit 1
+          fi
+          rm -rf build-missing-check
+      - name: Configure and build ASan + UBSan (CI synthetic mode without game files)
+        run: |
+          cmake -S . -B build-asan \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSAN4_CI_NO_GAME=ON \
+            -DSAN4_ENABLE_SANITIZERS=ON \
+            -DSAN4_WARNINGS_AS_ERRORS=ON
+          cmake --build build-asan -j
+      - name: Run ASan + UBSan synthetic conformance & hygiene tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-asan --output-on-failure
+      - name: Configure and build ThreadSanitizer (CI synthetic mode without game files)
+        run: |
+          cmake -S . -B build-tsan \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSAN4_CI_NO_GAME=ON \
+            -DSAN4_ENABLE_TSAN=ON \
+            -DSAN4_WARNINGS_AS_ERRORS=ON
+          cmake --build build-tsan -j
+      - name: Run ThreadSanitizer synthetic conformance & concurrency tests
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build-tsan --output-on-failure
