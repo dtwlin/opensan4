@@ -340,13 +340,18 @@ Command-Line Options (PowerShell / cmd.exe):
 WINEOF
 
   ZIP_OUT="${BUILD_DIR}/san4-win64-portable.zip"
-  python3 - "${ZIP_OUT}" \
-    "${BUILD_DIR}/san4.exe" \
-    "${BUILD_DIR}/san4-hdpack-gen.exe" \
-    "${README_WIN}" \
-    "${ROOT_DIR}/README.md" \
-    "${ROOT_DIR}/LICENSE" \
-    "${LICENSES_OUT}" << 'PYEOF'
+  ZIP_ARGS=(
+    "${BUILD_DIR}/san4.exe"
+    "${BUILD_DIR}/san4-hdpack-gen.exe"
+    "${README_WIN}"
+    "${ROOT_DIR}/README.md"
+    "${ROOT_DIR}/LICENSE"
+    "${LICENSES_OUT}"
+  )
+  if [[ -f "${ROOT_DIR}/README.zh-TW.md" ]]; then
+    ZIP_ARGS+=("${ROOT_DIR}/README.zh-TW.md")
+  fi
+  python3 - "${ZIP_OUT}" "${ZIP_ARGS[@]}" << 'PYEOF'
 import os
 import sys
 import zipfile

@@ -1,5 +1,7 @@
 # OpenSan4 — Native Linux & Windows 11 Runtime + 4x HD Asset Pack Generator for Romance of the Three Kingdoms IV (DOS)
 
+**Language / 語言:** English | [繁體中文（臺灣）](README.zh-TW.md)
+
 **OpenSan4** (`opensan4` — `san4-linux` on Linux, `san4.exe` on Windows 11, and `san4-hdpack-gen` / `san4-hdpack-gen.exe`) is a clean-room, open-source (`GPL-2.0-or-later`) native `x86_64` Linux and Windows 11 runtime and Bring-Your-Own-Game (BYOG) `4x` HD asset pack generator for the Traditional Chinese MS-DOS release of *Romance of the Three Kingdoms IV* (`三國志 IV` / `SAN4`). It runs the original 16-bit DOS game executables directly in a lightweight C++20 process—without DOSBox—while adding modern quality-of-life controls, smooth 24-bit crossfades, multi-threaded pixel upscaling, and full `4x` (`3200x2400`) 32-bit RGBA HD graphics across 100% of the game's archives.
 
 ## Legal & Bring-Your-Own-Game (BYOG) Notice
@@ -160,7 +162,8 @@ Cross-compile (or natively build under MSYS2 MinGW-w64) self-contained `x86_64` 
   ├── hd_pack\                  (Auto-loaded when present next to san4.exe; or --hd-pack <DIR>)
   ├── LICENSE
   ├── THIRD_PARTY_LICENSES.txt
-  └── README.md
+  ├── README.md
+  └── README.zh-TW.md
   ```
 
 ## Generating & Using the Complete `4x` HD Asset Pack
