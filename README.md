@@ -74,7 +74,7 @@ ctest --test-dir build --output-on-failure
 
 ### Public CI / Engine-Only Build (No Game Files Needed)
 
-Contributors and CI runners can compile `san4-linux`, `san4-hdpack-gen`, and `san4_tests` (`-Wall -Wextra -Wpedantic -Werror`) and run all `61` synthetic conformance, codec, upscaler, emulation, concurrency, LTO/SIMD, security, and hygiene test suites under both ASan + UBSan and ThreadSanitizer (TSan) without owning the game files:
+Contributors and CI runners can compile `san4-linux`, `san4-hdpack-gen`, and `san4_tests` (`-Wall -Wextra -Wpedantic -Werror`) and run all `70` synthetic conformance, codec, upscaler, emulation, concurrency, CLI/host, LTO/SIMD, security, and hygiene test suites under AddressSanitizer + UndefinedBehaviorSanitizer, ThreadSanitizer (TSan), and Clang `llvm-cov` source-based code coverage without owning the game files:
 
 ```bash
 # AddressSanitizer + UndefinedBehaviorSanitizer
@@ -86,6 +86,9 @@ ctest --test-dir build-asan --output-on-failure
 cmake -S . -B build-tsan -DSAN4_CI_NO_GAME=ON -DSAN4_ENABLE_TSAN=ON -DSAN4_WARNINGS_AS_ERRORS=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
+
+# Clang source-based code coverage report (llvm-cov)
+./scripts/run_coverage.sh --min-line-pct 90
 ```
 
 ### CMake Options
@@ -101,6 +104,7 @@ ctest --test-dir build-tsan --output-on-failure
 - `-DSAN4_WARNINGS_AS_ERRORS=ON`: Treat compiler warnings as errors (`-Werror`).
 - `-DSAN4_ENABLE_SANITIZERS=ON`: Instrument targets with AddressSanitizer + UndefinedBehaviorSanitizer (mutually exclusive with `SAN4_ENABLE_TSAN`).
 - `-DSAN4_ENABLE_TSAN=ON`: Instrument targets with ThreadSanitizer (mutually exclusive with `SAN4_ENABLE_SANITIZERS`).
+- `-DSAN4_ENABLE_COVERAGE=ON`: Instrument targets with Clang source-based code coverage (`-fprofile-instr-generate -fcoverage-mapping`; requires Clang and is mutually exclusive with sanitizers, PGO, and `SAN4_STATIC`).
 - `-DSAN4_STATIC=ON`: Portable build that links SDL2, libx86emu, libpng, zlib, `libstdc++` and `libgcc` statically from `SAN4_STATIC_PREFIX` (`OFF` by default; incompatible with the sanitizer options). See [Portable Static Build](#portable-static-build).
 - `-DSAN4_STATIC_PREFIX=<DIR>`: Prefix populated by `scripts/build_static_deps.sh` (default `third_party/static`, or `third_party/static-clang-lto` under `./scripts/build_static.sh --clang-lto`). Configuration fails with the list of missing headers / archives if it is incomplete.
 

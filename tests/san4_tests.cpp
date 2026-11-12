@@ -22,7 +22,9 @@
 #include <vector>
 
 #include <SDL2/SDL.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -38,6 +40,7 @@
 #include "grp600c_defs.h"
 #include "grp_census.h"
 #include "hd_gen/hd_art_upscaler.h"
+#include "hd_gen/hd_pack_generator.h"
 #include "hd_gen/san4_codecs.h"
 #include "hd_pack.h"
 #include "host_channel.h"
@@ -46,6 +49,7 @@
 #include "reference/hd_composite_ref.h"
 #include "present_tracker.h"
 #include "render_policy.h"
+#include "runtime_cli.h"
 #include "sdl_host.h"
 #include "upscaler.h"
 #include "util/simd_blend.h"
@@ -71,10 +75,20 @@ int g_failures = 0;
 class ScopedTempDir {
  public:
   ScopedTempDir() {
+    static std::atomic<std::uint64_t> seq{0};
     auto base = std::filesystem::temp_directory_path();
     const auto stamp =
         std::chrono::steady_clock::now().time_since_epoch().count();
-    path_ = base / ("san4_unit_" + std::to_string(stamp));
+#ifdef _WIN32
+    const auto pid = static_cast<unsigned long>(::_getpid());
+#else
+    const auto pid = static_cast<unsigned long>(::getpid());
+#endif
+    const auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const auto idx = seq.fetch_add(1u, std::memory_order_relaxed);
+    path_ = base / ("san4_unit_" + std::to_string(pid) + "_" +
+                    std::to_string(tid) + "_" + std::to_string(stamp) + "_" +
+                    std::to_string(idx));
     std::filesystem::create_directories(path_);
   }
   ~ScopedTempDir() {
@@ -6067,6 +6081,39 @@ struct SdlHostTestPeer {
         host.mailbox_);
   }
   static void stop_emu(SdlHost& host) { host.emu_thread_.stop(); }
+  static void shutdown_sdl(SdlHost& host) { host.shutdown_sdl(); }
+  static void audio_callback(void* userdata, std::uint8_t* stream, int len) {
+    SdlHost::sdl_audio_callback(userdata, stream, len);
+  }
+  static std::uint64_t upload_rects(SdlHost& host, const std::uint32_t* argb,
+                                    std::span<const UpscaleDirtyRect> rects) {
+    return host.upload_rects(argb, rects);
+  }
+  static bool present_slot(SdlHost& host, const FrameMailbox::Slot& slot) {
+    return host.present_slot(slot);
+  }
+  static void drain_host_events(SdlHost& host) { host.drain_host_events(); }
+  static void window_to_dos_coords(const SdlHost& host, int wx, int wy,
+                                   int& out_dx, int& out_dy) {
+    host.window_to_dos_coords(wx, wy, out_dx, out_dy);
+  }
+  static void dos_to_window_coords(const SdlHost& host, int dx, int dy,
+                                   int active_w, int active_h, int& out_wx,
+                                   int& out_wy) {
+    host.dos_to_window_coords(dx, dy, active_w, active_h, out_wx, out_wy);
+  }
+  static bool execute_headless_command(SdlHost& host,
+                                       const std::vector<std::string>& parts,
+                                       bool& running, bool& force_full) {
+    return host.execute_headless_command(parts, running, force_full);
+  }
+  static bool recreate_renderer_after_reset(SdlHost& host) {
+    return host.recreate_renderer_after_reset();
+  }
+  static EmuSession& session(SdlHost& host) { return host.session_; }
+  static SDL_AudioDeviceID audio_dev(const SdlHost& host) {
+    return host.audio_dev_;
+  }
 };
 
 }  // namespace san4
@@ -7387,6 +7434,2268 @@ void test_machine_rom_protection_noperm_vram_and_ubsan_shifts() {
   CHECK(read_ram32(m, kBase + 0x0Cu) == 0xBEEFCAFEu);
 }
 
+namespace {
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    if (const char* cur = std::getenv(name)) {
+      had_prev_ = true;
+      prev_ = cur;
+    }
+    set_raw(name, value);
+  }
+  ~ScopedEnvVar() {
+    set_raw(name_.c_str(), had_prev_ ? prev_.c_str() : nullptr);
+  }
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+ private:
+  static void set_raw(const char* name, const char* val) {
+#ifdef _WIN32
+    _putenv_s(name, val != nullptr ? val : "");
+    const std::filesystem::path wname = san4::util::utf8_to_path(name);
+    const std::filesystem::path wval =
+        san4::util::utf8_to_path(val != nullptr ? val : "");
+    _wputenv_s(wname.c_str(), wval.c_str());
+#else
+    if (val != nullptr) {
+      setenv(name, val, 1);
+    } else {
+      unsetenv(name);
+    }
+#endif
+  }
+
+  std::string name_;
+  std::string prev_;
+  bool had_prev_ = false;
+};
+
+class ScopedCurrentDir {
+ public:
+  explicit ScopedCurrentDir(const std::filesystem::path& next) {
+    std::error_code ec;
+    prev_ = std::filesystem::current_path(ec);
+    std::filesystem::current_path(next, ec);
+  }
+  ~ScopedCurrentDir() {
+    if (!prev_.empty()) {
+      std::error_code ec;
+      std::filesystem::current_path(prev_, ec);
+    }
+  }
+  ScopedCurrentDir(const ScopedCurrentDir&) = delete;
+  ScopedCurrentDir& operator=(const ScopedCurrentDir&) = delete;
+
+ private:
+  std::filesystem::path prev_;
+};
+
+void write_binary_file_checked(const std::filesystem::path& p,
+                               std::span<const std::uint8_t> bytes) {
+  std::error_code ec;
+  if (p.has_parent_path()) {
+    std::filesystem::create_directories(p.parent_path(), ec);
+  }
+  std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+  if (!bytes.empty()) {
+    ofs.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+  }
+}
+
+std::vector<std::uint8_t> build_synthetic_ls11(
+    const std::vector<std::vector<std::uint8_t>>& records) {
+  std::vector<std::uint8_t> out(0x0110u, 0u);
+  out[0] = 'L';
+  out[1] = 'S';
+  out[2] = '1';
+  out[3] = '1';
+  for (int i = 0; i < 256; ++i) {
+    out[0x0010u + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i);
+  }
+  const std::size_t idx_bytes = records.size() * 12u + 4u;
+  out.resize(0x0110u + idx_bytes, 0u);
+
+  auto put_be32 = [&](std::size_t off, std::uint32_t v) {
+    out[off + 0u] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
+    out[off + 1u] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);
+    out[off + 2u] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+    out[off + 3u] = static_cast<std::uint8_t>(v & 0xFFu);
+  };
+
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    const auto file_off = static_cast<std::uint32_t>(out.size());
+    const auto len = static_cast<std::uint32_t>(records[i].size());
+    const std::size_t idx_pos = 0x0110u + i * 12u;
+    put_be32(idx_pos + 0u, len);
+    put_be32(idx_pos + 4u, len);
+    put_be32(idx_pos + 8u, file_off);
+    out.insert(out.end(), records[i].begin(), records[i].end());
+  }
+  return out;
+}
+
+std::vector<std::uint8_t> build_synthetic_npk_image(
+    bool use_npk16_magic, bool use_default_pc98_pal, int w, int h,
+    std::uint16_t lit_word0, std::uint16_t lit_word1) {
+  std::vector<std::uint8_t> out(48u, 0u);
+  if (use_npk16_magic) {
+    std::memcpy(out.data(), "NPK16\0", 6u);
+  } else {
+    std::memcpy(out.data(), "NPK016", 6u);
+  }
+  auto put_le16 = [&](std::size_t off, std::uint16_t v) {
+    out[off + 0u] = static_cast<std::uint8_t>(v & 0xFFu);
+    out[off + 1u] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+  };
+  put_le16(6u, 4u);
+  put_le16(8u, 640u);
+  put_le16(10u, 400u);
+  put_le16(12u, static_cast<std::uint16_t>(w));
+  put_le16(14u, static_cast<std::uint16_t>(h));
+
+  static constexpr std::array<std::uint16_t, 16> kDefPc98 = {
+      0x000u, 0x00Fu, 0x0F0u, 0x0FFu, 0xF00u, 0xF0Fu, 0xFF0u, 0xFFFu,
+      0x777u, 0x00Au, 0x0A0u, 0x0AAu, 0xA00u, 0xA0Au, 0xAA0u, 0xAAAu,
+  };
+  for (std::size_t c = 0; c < 16u; ++c) {
+    const std::uint16_t grb =
+        use_default_pc98_pal
+            ? kDefPc98[c]
+            : static_cast<std::uint16_t>(((c * 0x123u) + 0x246u) & 0x0FFFu);
+    put_le16(16u + c * 2u, grb);
+  }
+
+  // Row 0: literal word0 (flag=0), horizontal repeat cx=words_per_row-1 (flag=1)
+  // Rows 1..h-1: literal word1 on col 0 (flag=0), vertical repeat from row above
+  // (flag=1, m=0x80 | (cx-1)) when words_per_row >= 2!
+  const int words_per_row = w / 4;
+  std::uint8_t cur_flags = 0u;
+  int bit_idx = 0;
+  std::size_t flag_pos = 0u;
+  auto emit_flag = [&](bool cf) {
+    if (bit_idx == 0) {
+      flag_pos = out.size();
+      out.push_back(0u);
+      cur_flags = 0u;
+    }
+    if (cf) {
+      cur_flags = static_cast<std::uint8_t>(cur_flags | (1u << bit_idx));
+    }
+    out[flag_pos] = cur_flags;
+    bit_idx = (bit_idx + 1) & 7;
+  };
+  auto emit_u16 = [&](std::uint16_t v) {
+    out.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+    out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFu));
+  };
+
+  for (int y = 0; y < h; ++y) {
+    emit_flag(false);
+    emit_u16((y == 0) ? lit_word0 : lit_word1);
+    if (words_per_row > 1) {
+      emit_flag(true);
+      const auto rem = static_cast<std::uint8_t>(
+          std::min(words_per_row - 1, 32) - 1);
+      // Row 0 copies horizontally (bit7=0, step=1); later rows copy vertically
+      // from previous row (bit7=1, step=1 -> 200 words back).
+      out.push_back(static_cast<std::uint8_t>((y == 0 ? 0x00u : 0x80u) | rem));
+    }
+  }
+  return out;
+}
+
+void test_runtime_cli_parsing_discovery_and_execution() {
+  ScopedEnvVar no_dlg("SAN4_NO_ERROR_DIALOG", "1");
+  ScopedEnvVar clr_game("SAN4_GAME_DIR", nullptr);
+  ScopedEnvVar vid_drv("SDL_VIDEODRIVER", "dummy");
+  ScopedEnvVar aud_drv("SDL_AUDIODRIVER", "dummy");
+
+  // 1) Help & valid flag parsing (both --flag val and --flag=val forms).
+  {
+    san4::ParsedRuntimeCli parsed;
+    std::ostringstream out, err;
+    CHECK(san4::parse_runtime_cli({"san4-linux", "--help"}, "san4-linux",
+                                  parsed, out, err) == 0);
+    CHECK(parsed.show_help);
+    CHECK(out.str().find("--headless-script") != std::string::npos);
+
+    out.str("");
+    CHECK(san4::parse_runtime_cli({"san4-linux", "-h"}, "san4-linux", parsed,
+                                  out, err) == 0);
+    CHECK(parsed.show_help);
+
+    const std::vector<std::string> full_args = {
+        "san4-linux",
+        "--game-dir", "/tmp/g",
+        "--save-dir=/tmp/s",
+        "--scale", "xbr2x",
+        "--window-scale=3",
+        "--speed", "4",
+        "--hd-pack=/tmp/hd",
+        "--dump-sprites", "/tmp/dump",
+        "--skip-intro",
+        "--fullscreen",
+        "--windowed",
+        "--no-mouse-warp",
+        "--headless-script=frames:1;quit",
+        "--deterministic",
+        "--renderer=cpu",
+        "--profile-frames", "/tmp/prof.tsv",
+        "--threads=8",
+    };
+    CHECK(san4::parse_runtime_cli(full_args, "san4-linux", parsed, out, err) ==
+          0);
+    CHECK(!parsed.show_help);
+    CHECK(parsed.cli_game_dir == "/tmp/g");
+    CHECK(parsed.explicit_scale);
+    CHECK(parsed.opts.upscale_mode == san4::UpscaleMode::Xbr2x);
+    CHECK(parsed.opts.window_scale == 3);
+    CHECK(parsed.opts.speed_multiplier == 4);
+    CHECK(!parsed.opts.fullscreen);
+    CHECK(!parsed.opts.mouse_warp);
+    CHECK(parsed.opts.skip_intro);
+    CHECK(parsed.opts.deterministic);
+    CHECK(parsed.opts.renderer == san4::RendererPreference::Cpu);
+    CHECK(parsed.opts.threads == 8u);
+
+    // --no-hd-pack clears any earlier --hd-pack.
+    CHECK(san4::parse_runtime_cli(
+              {"san4-linux", "--hd-pack=/tmp/hd", "--no-hd-pack"}, "san4-linux",
+              parsed, out, err) == 0);
+    CHECK(parsed.no_hd_pack && parsed.opts.hd_pack_dir.empty());
+  }
+
+  // 2) Exhaustive error branches in parse_runtime_cli.
+  {
+    static const std::vector<std::vector<std::string>> kBadArgs = {
+        {"san4", "--game-dir"},
+        {"san4", "--game-dir="},
+        {"san4", "--save-dir"},
+        {"san4", "--scale"},
+        {"san4", "--scale=bogus"},
+        {"san4", "--window-scale"},
+        {"san4", "--window-scale=0"},
+        {"san4", "--window-scale=9"},
+        {"san4", "--speed"},
+        {"san4", "--speed=3"},
+        {"san4", "--hd-pack"},
+        {"san4", "--dump-sprites"},
+        {"san4", "--headless-script"},
+        {"san4", "--deterministic"},
+        {"san4", "--renderer"},
+        {"san4", "--renderer=vulkan"},
+        {"san4", "--profile-frames"},
+        {"san4", "--threads"},
+        {"san4", "--threads=-1"},
+        {"san4", "--threads=65"},
+        {"san4", "--unknown-flag"},
+    };
+    for (const auto& bad : kBadArgs) {
+      san4::ParsedRuntimeCli parsed;
+      std::ostringstream out, err;
+      CHECK(san4::parse_runtime_cli(bad, "san4", parsed, out, err) == 2);
+      CHECK(!err.str().empty());
+    }
+  }
+
+  // 3) BYOG manifest verification failure formatting (>8 errors, wrong size,
+  //    corrupt SHA-256, san4_game_dir.txt hint file, SAN4_GAME_DIR env).
+  {
+    ScopedTempDir tmp;
+    const auto bad_game = tmp.path() / "bad_san4";
+    std::filesystem::create_directories(bad_game);
+    // Write corrupt EDMUSIC.S4 (exact 8706 size, wrong SHA-256) and wrong-sized
+    // mutable NBDATA.S4 (100 != 17496).
+    const std::vector<std::uint8_t> zeros_ed(8706u, 0xAAu);
+    const std::vector<std::uint8_t> short_nb(100u, 0x00u);
+    write_binary_file_checked(bad_game / "EDMUSIC.S4", zeros_ed);
+    write_binary_file_checked(bad_game / "NBDATA.S4", short_nb);
+    write_binary_file_checked(bad_game / "SAN486.COM", short_nb);
+
+    const auto bin_dir = tmp.path() / "bin";
+    std::filesystem::create_directories(bin_dir);
+    {
+      std::ofstream hf(bin_dir / "san4_game_dir.txt", std::ios::binary);
+      hf << san4::util::path_to_utf8(bad_game) << "  \r\n";
+    }
+
+    std::ostringstream out, err;
+    const int rc = san4::run_runtime_cli(
+        {"san4-linux"}, "san4-linux", bin_dir / "san4-linux", out, err, true);
+    CHECK(rc == 1);
+    CHECK(err.str().find("SHA-256 mismatch on EDMUSIC.S4") != std::string::npos);
+    CHECK(err.str().find("more issue(s)") != std::string::npos);
+
+    // No game directory anywhere -> clean error message (hermetic wrt cwd & env).
+    ScopedTempDir empty_root;
+    const auto isolated_cwd = empty_root.path() / "sub" / "cwd";
+    std::filesystem::create_directories(isolated_cwd);
+    ScopedCurrentDir cwd_guard(isolated_cwd);
+    ScopedEnvVar no_game_env("SAN4_GAME_DIR", nullptr);
+    ScopedEnvVar no_xdg("XDG_DATA_HOME",
+                        san4::util::path_to_utf8(empty_root.path() / "no_xdg").c_str());
+    ScopedEnvVar no_home("HOME",
+                         san4::util::path_to_utf8(empty_root.path() / "no_home").c_str());
+    ScopedEnvVar no_local_app(
+        "LOCALAPPDATA",
+        san4::util::path_to_utf8(empty_root.path() / "no_local").c_str());
+    ScopedEnvVar no_appdata(
+        "APPDATA",
+        san4::util::path_to_utf8(empty_root.path() / "no_roam").c_str());
+    const auto check_none = san4::resolve_and_verify_game_dir(
+        "", isolated_cwd / "bin" / "san4-linux");
+    CHECK(!check_none.ok);
+  }
+
+  // 4) Full synthetic runtime execution via run_runtime_cli (both headless &
+  //    interactive auto-discovery of hd_pack + read-only save_dir fallback).
+  {
+    ScopedTempDir tmp;
+    const auto app_root = tmp.path() / "app";
+    const auto exe_dir = app_root / "bin";
+    const auto game_dir = app_root / "SAN4";
+    const auto hd_dir = app_root / "hd_pack";
+    const auto xdg_dir = tmp.path() / "xdg_data";
+    std::filesystem::create_directories(exe_dir);
+    std::filesystem::create_directories(game_dir);
+    std::filesystem::create_directories(hd_dir);
+    std::filesystem::create_directories(xdg_dir);
+
+    // Minimal DOS .COM stub: `mov ax, 0x4C00; int 0x21`
+    static constexpr std::uint8_t kExitCom[] = {0xB8, 0x00, 0x4C, 0xCD, 0x21};
+    write_binary_file_checked(game_dir / "SAN486.COM", kExitCom);
+    // Read-only SAVEDAT.S4 so is_game_dir_writable returns false and triggers
+    // select_user_save_dir()!
+    write_binary_file_checked(game_dir / "SAVEDAT.S4", kExitCom);
+    std::error_code perm_ec;
+    std::filesystem::permissions(game_dir / "SAVEDAT.S4",
+                                 std::filesystem::perms::owner_read,
+                                 std::filesystem::perm_options::replace,
+                                 perm_ec);
+
+    {
+      std::ofstream mf(hd_dir / "hd_manifest.tsv", std::ios::binary);
+      mf << "# synthetic manifest\n";
+    }
+
+    ScopedEnvVar xdg_env("XDG_DATA_HOME",
+                         san4::util::path_to_utf8(xdg_dir).c_str());
+    ScopedEnvVar local_app_env("LOCALAPPDATA",
+                               san4::util::path_to_utf8(xdg_dir).c_str());
+
+    // Headless execution
+    std::ostringstream out, err;
+    CHECK(san4::run_runtime_cli(
+              {"san4-linux",
+               "--game-dir=" + san4::util::path_to_utf8(game_dir),
+               "--headless-script=frames:1;quit"},
+              "san4-linux", exe_dir / "san4-linux", out, err, false) == 0);
+
+    // Interactive execution (parent hd_pack discovery + read-only save fallback)
+    out.str("");
+    err.str("");
+    CHECK(san4::run_runtime_cli(
+              {"san4-linux",
+               "--game-dir=" + san4::util::path_to_utf8(game_dir)},
+              "san4-linux", exe_dir / "san4-linux", out, err, false) == 0);
+
+    std::filesystem::permissions(
+        game_dir / "SAVEDAT.S4",
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::add, perm_ec);
+  }
+}
+
+void test_hdpack_generator_cli_and_synthetic_pipeline() {
+  // 1) Compressed LS11 varint + LZSS back-reference & corrupt stream checks.
+  {
+    std::vector<std::uint8_t> comp_bits;
+    int bit_used = 0;
+    auto push_bit = [&](std::uint32_t b) {
+      if (bit_used == 0) {
+        comp_bits.push_back(0u);
+      }
+      if (b != 0u) {
+        comp_bits.back() = static_cast<std::uint8_t>(
+            comp_bits.back() | (1u << (7 - bit_used)));
+      }
+      bit_used = (bit_used + 1) & 7;
+    };
+    auto push_varint = [&](std::uint32_t val) {
+      unsigned cx = 1u;
+      while (true) {
+        const std::uint32_t base = (1u << cx) - 2u;
+        const std::uint32_t span = (1u << cx);
+        if (val >= base && val - base < span) {
+          for (unsigned i = 0; i + 1u < cx; ++i) push_bit(1u);
+          push_bit(0u);
+          const std::uint32_t di = val - base;
+          for (unsigned i = 0; i < cx; ++i) {
+            push_bit((di >> (cx - 1u - i)) & 1u);
+          }
+          break;
+        }
+        ++cx;
+      }
+    };
+    // Emit 4 literal bytes (0, 1, 2, 3) then LZSS copy dist=4 (code=260),
+    // len=4 (len_code=1 -> 1+3=4) => 8 uncompressed bytes {0,1,2,3,0,1,2,3}.
+    push_varint(0u);
+    push_varint(1u);
+    push_varint(2u);
+    push_varint(3u);
+    push_varint(260u);
+    push_varint(1u);
+
+    std::vector<std::uint8_t> ls11(0x0110u + 16u, 0u);
+    ls11[0] = 'L';
+    ls11[1] = 'S';
+    ls11[2] = '1';
+    ls11[3] = '1';
+    for (int i = 0; i < 256; ++i) {
+      ls11[0x0010u + static_cast<std::size_t>(i)] =
+          static_cast<std::uint8_t>(0xA0u + (i & 0x0Fu));
+    }
+    auto put_be32 = [&](std::size_t off, std::uint32_t v) {
+      ls11[off + 0u] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
+      ls11[off + 1u] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);
+      ls11[off + 2u] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+      ls11[off + 3u] = static_cast<std::uint8_t>(v & 0xFFu);
+    };
+    const auto file_off = static_cast<std::uint32_t>(ls11.size());
+    put_be32(0x0110u, static_cast<std::uint32_t>(comp_bits.size()));
+    put_be32(0x0114u, 8u);
+    put_be32(0x0118u, file_off);
+    ls11.insert(ls11.end(), comp_bits.begin(), comp_bits.end());
+
+    std::vector<std::vector<std::uint8_t>> recs;
+    CHECK(san4::codecs::decompress_ls11_archive(ls11, recs));
+    CHECK(recs.size() == 1u && recs[0].size() == 8u);
+    CHECK(recs[0][0] == 0xA0u && recs[0][3] == 0xA3u &&
+          recs[0][4] == 0xA0u && recs[0][7] == 0xA3u);
+
+    // Corrupt varint (>24 leading 1s) must fail cleanly.
+    std::fill(ls11.begin() + file_off, ls11.end(), 0xFFu);
+    ls11.resize(file_off + 6u, 0xFFu);
+    put_be32(0x0110u, 6u);
+    CHECK(!san4::codecs::decompress_ls11_archive(ls11, recs));
+  }
+
+  // 2) CLI validation & missing archive error handling.
+  {
+    std::ostringstream out, err;
+    CHECK(san4::hd_gen::run_hdpack_gen_cli({"gen", "--help"}, "gen", {}, out,
+                                           err, true) == 0);
+    CHECK(out.str().find("--out-dir") != std::string::npos);
+
+    static const std::vector<std::vector<std::string>> kBadCli = {
+        {"gen"},
+        {"gen", "--game-dir"},
+        {"gen", "--game-dir="},
+        {"gen", "--out-dir"},
+        {"gen", "--out-dir="},
+        {"gen", "--jobs"},
+        {"gen", "--jobs=0", "--out-dir=/tmp/x"},
+        {"gen", "--jobs=129", "--out-dir=/tmp/x"},
+        {"gen", "--unknown"},
+    };
+    for (const auto& bad : kBadCli) {
+      out.str("");
+      err.str("");
+      CHECK(san4::hd_gen::run_hdpack_gen_cli(bad, "gen", {}, out, err, true) ==
+            2);
+    }
+
+    ScopedTempDir tmp;
+    err.str("");
+    CHECK(san4::hd_gen::run_hdpack_gen_cli(
+              {"gen", "--out-dir=" + san4::util::path_to_utf8(tmp.path() / "o")},
+              "gen", {}, out, err, false) == 2);
+    CHECK(san4::hd_gen::run_hdpack_gen_cli(
+              {"gen", "--game-dir=" + san4::util::path_to_utf8(tmp.path()),
+               "--out-dir=" + san4::util::path_to_utf8(tmp.path() / "o")},
+              "gen", {}, out, err, true) == 1);
+    CHECK(san4::hd_gen::generate_hd_pack_from_dir(
+              tmp.path(), tmp.path() / "o", 2, out, err) == 1);
+  }
+
+  // 3) Full 15-stage multi-threaded synthetic HD pack generation & round-trip
+  //    HdPackManager loading!
+  ScopedTempDir tmp;
+  const auto synth_game = tmp.path() / "synth_san4";
+  const auto out_pack = tmp.path() / "out_hd_pack";
+  std::filesystem::create_directories(synth_game);
+
+  // 3a) Synthetic MAIN.EXE (0x4A160 bytes: 4-bit BRG palettes + eye/mouth Y).
+  {
+    std::vector<std::uint8_t> main_exe(0x4A160u, 0u);
+    for (std::size_t i = 0; i < 48u; ++i) {
+      main_exe[0x47732u + i] = static_cast<std::uint8_t>((i * 3u + 2u) & 0x0Fu);
+    }
+    for (std::size_t i = 0; i < 24u; ++i) {
+      main_exe[0x478C2u + i] = static_cast<std::uint8_t>((i + 4u) & 0x0Fu);
+      main_exe[0x47922u + i] = static_cast<std::uint8_t>((i + 6u) & 0x0Fu);
+      main_exe[0x39C24u + i] = static_cast<std::uint8_t>((i + 1u) & 0x0Fu);
+    }
+    for (std::size_t i = 0; i < 16u; ++i) {
+      main_exe[0x4A13Au + i] = 20u;
+      main_exe[0x4A14Au + i] = 44u;
+    }
+    write_binary_file_checked(synth_game / "MAIN.EXE", main_exe);
+  }
+
+  // 3b) Synthetic kaodata.s4 (lowercase filename tests find_case_insensitive_file!).
+  //     2 portraits (8x8) exercising 0xFE 0x01 literal, 0xFE N repeat, 0xFE 0x00
+  //     256-repeat, copy_up=false/true, nib<8, 8<=nib<12, and nib>=12.
+  {
+    std::vector<std::uint8_t> kao(0x07F8u, 0u);
+    auto append_kao = [&](std::size_t idx, std::span<const std::uint8_t> stream) {
+      const std::size_t rel = kao.size() - 0x07F8u;
+      std::uint8_t* ent = kao.data() + idx * 6u;
+      ent[0] = static_cast<std::uint8_t>(rel & 0xFFu);
+      ent[1] = static_cast<std::uint8_t>((rel >> 8) & 0xFFu);
+      ent[2] = static_cast<std::uint8_t>((rel >> 16) & 0xFFu);
+      const auto clen = static_cast<std::uint16_t>(4u + stream.size());
+      ent[4] = static_cast<std::uint8_t>(clen & 0xFFu);
+      ent[5] = static_cast<std::uint8_t>((clen >> 8) & 0xFFu);
+      kao.push_back(8u);
+      kao.push_back(0u);
+      kao.push_back(8u);
+      kao.push_back(0u);
+      kao.insert(kao.end(), stream.begin(), stream.end());
+    };
+    static constexpr std::uint8_t kKaoStream0[] = {
+        0x01, 0x23, 0x89, 0xFE, 0x01, 0xC2, 0xFE, 0x04, 0x95, 0xFE, 0x00,
+    };
+    static constexpr std::uint8_t kKaoStream1[] = {
+        0x82, 0x45, 0xA3, 0xD1, 0x16, 0xFE, 0x03,
+    };
+    append_kao(0u, kKaoStream0);
+    append_kao(1u, kKaoStream1);
+    write_binary_file_checked(synth_game / "kaodata.s4", kao);
+  }
+
+  // 3c) Synthetic MONDATA.S4 (16 templates x 0x2E80 bytes = 190,464 bytes).
+  {
+    std::vector<std::uint8_t> mon(16u * 0x2E80u, 0u);
+    for (std::size_t i = 0; i < mon.size(); ++i) {
+      mon[i] = static_cast<std::uint8_t>((i * 13u + (i >> 9)) & 0xFFu);
+    }
+    write_binary_file_checked(synth_game / "MONDATA.S4", mon);
+  }
+
+  // 3d) 10 NPK containers (including OPENDAT.S4 48-byte scene palette block).
+  {
+    static constexpr std::array<std::string_view, 10> kNpkNames = {
+        "OPENDAT.S4", "ENDDAT.S4",  "PACKGRP.S4", "PACKGRP2.S4", "PACKGRP3.S4",
+        "HIBACK.S4",  "LOGO.S4",    "REVGRP.S4",  "HEGRP.S4",    "PREGRP.S4",
+    };
+    for (std::size_t idx = 0; idx < kNpkNames.size(); ++idx) {
+      std::vector<std::uint8_t> container;
+      if (kNpkNames[idx] == "HEGRP.S4") {
+        // HEGRP.S4 has sprite sheet in [0..0x225F] before NPK images!
+        container.resize(0x2260u, 0u);
+        for (std::size_t b = 0; b < container.size(); ++b) {
+          container[b] = static_cast<std::uint8_t>((b * 7u + 3u) & 0xFFu);
+        }
+      } else if (kNpkNames[idx] == "OPENDAT.S4") {
+        // Prepend a valid 48-byte [B,R,G] scene palette block (values in 0..15).
+        for (std::size_t b = 0; b < 48u; ++b) {
+          container.push_back(static_cast<std::uint8_t>((b % 14u) + 1u));
+        }
+      }
+      const bool use_npk16 = (idx % 2u == 1u);
+      const bool def_pal = (kNpkNames[idx] != "PACKGRP.S4");
+      const auto npk = build_synthetic_npk_image(
+          use_npk16, def_pal, 8, 4,
+          static_cast<std::uint16_t>(0x1234u + idx * 0x111u),
+          static_cast<std::uint16_t>(0x5678u + idx * 0x222u));
+      container.insert(container.end(), npk.begin(), npk.end());
+      write_binary_file_checked(synth_game / kNpkNames[idx], container);
+    }
+  }
+
+  // Helper to fill planar tile bytes with both opaque and masked (game_color=0)
+  // 16x16 patterns while keeping duplicate hashes low for fast test execution.
+  auto make_planar_buf = [](std::size_t len, std::uint8_t seed) {
+    std::vector<std::uint8_t> buf(len, 0u);
+    for (std::size_t off = 0; off + 128u <= len; off += 128u) {
+      const bool masked_variant = (((off / 128u) & 1u) != 0u);
+      for (std::size_t b = 0; b < 128u; ++b) {
+        buf[off + b] = masked_variant
+                           ? static_cast<std::uint8_t>((b & 1u) ? (seed | 0x55u) : 0x00u)
+                           : static_cast<std::uint8_t>(seed | 0xFFu);
+      }
+    }
+    return buf;
+  };
+
+  // 3e) LS11 tile & sprite archives: MAINCG, TOSHICG, HEXGRP, HKGRP, HUNIT, HIGRP, GRAPH, HWGRP.
+  write_binary_file_checked(
+      synth_game / "MAINCG.S4",
+      build_synthetic_ls11({make_planar_buf(0xFF40u, 0x10u)}));
+  write_binary_file_checked(
+      synth_game / "TOSHICG.S4",
+      build_synthetic_ls11({make_planar_buf(195u * 128u, 0x20u)}));
+  write_binary_file_checked(
+      synth_game / "HEXGRP.S4",
+      build_synthetic_ls11({make_planar_buf(156u * 128u, 0x30u)}));
+  {
+    std::vector<std::vector<std::uint8_t>> hk_recs(8u, make_planar_buf(128u, 0x40u));
+    write_binary_file_checked(synth_game / "HKGRP.S4",
+                              build_synthetic_ls11(hk_recs));
+  }
+  {
+    std::vector<std::vector<std::uint8_t>> hu_recs = {
+        make_planar_buf(128u, 0x50u),
+        make_planar_buf(128u, 0x54u),
+        make_planar_buf(0x4440u, 0x58u),
+    };
+    write_binary_file_checked(synth_game / "HUNIT.S4",
+                              build_synthetic_ls11(hu_recs));
+  }
+  {
+    std::vector<std::vector<std::uint8_t>> hi_recs(14u);
+    for (std::size_t i = 0; i < 13u; ++i) {
+      hi_recs[i] = make_planar_buf(4608u, 0x60u);
+    }
+    hi_recs[13] = make_planar_buf(0x2000u, 0x64u);
+    write_binary_file_checked(synth_game / "HIGRP.S4",
+                              build_synthetic_ls11(hi_recs));
+  }
+  {
+    auto graph_r0 = make_planar_buf(0x5A34u, 0x70u);
+    for (std::size_t i = 0; i < graph_r0.size(); ++i) {
+      graph_r0[i] = static_cast<std::uint8_t>((i * 19u + 5u) & 0xFFu);
+    }
+    write_binary_file_checked(synth_game / "GRAPH.S4",
+                              build_synthetic_ls11({graph_r0}));
+  }
+  write_binary_file_checked(synth_game / "HWGRP.S4",
+                            make_planar_buf(0x3E00u, 0x82u));
+
+  // Execute full generator pipeline across 16 worker threads!
+  std::ostringstream gen_out, gen_err;
+  const int gen_rc = san4::hd_gen::run_hdpack_gen_cli(
+      {"san4-hdpack-gen",
+       "--game-dir=" + san4::util::path_to_utf8(synth_game),
+       "--out-dir=" + san4::util::path_to_utf8(out_pack),
+       "--jobs=16"},
+      "san4-hdpack-gen", {}, gen_out, gen_err, false);
+  CHECK(gen_rc == 0);
+  CHECK(std::filesystem::is_regular_file(out_pack / "hd_manifest.tsv"));
+  CHECK(std::filesystem::file_size(out_pack / "mondata" / "mondata_index.bin") ==
+        8192u * sizeof(san4::MondataIndexEntry));
+  CHECK(std::filesystem::file_size(out_pack / "sprites" / "buttons" /
+                                   "button_index.bin") ==
+        1407u * sizeof(san4::ButtonIndexEntry));
+  CHECK(std::filesystem::file_size(out_pack / "tiles" / "tile_dict.bin") > 0u);
+
+  // Round-trip: load generated pack into HdPackManager and verify assets index cleanly!
+  san4::HdPackManager hd;
+  hd.set_pack_dir(out_pack);
+  CHECK(hd.loaded_texture_count() > 30u);
+}
+
+void test_sdl_host_headless_script_and_profiler_end_to_end() {
+  ScopedEnvVar vid_drv("SDL_VIDEODRIVER", "dummy");
+  ScopedEnvVar aud_drv("SDL_AUDIODRIVER", "dummy");
+
+  ScopedTempDir tmp;
+  const auto game_dir = tmp.path() / "game";
+  const auto hd_dir = tmp.path() / "hd";
+  std::filesystem::create_directories(game_dir);
+  std::filesystem::create_directories(hd_dir);
+  {
+    std::ofstream mf(hd_dir / "hd_manifest.tsv", std::ios::binary);
+    mf << "# empty\n";
+  }
+
+  // Synthetic 16-bit SAN486.COM:
+  //   mov ax, 0x4F02; mov bx, 0x0102; int 0x10          ; set VESA 800x600
+  //   mov ax, 0xA000; mov es, ax; mov byte [es:0], 0xFF ; dirty VRAM
+  //   mov dx, 0x0388; mov al, 0x20; out dx, al          ; AdLib reg write
+  //   inc dx; mov al, 0x01; out dx, al
+  //   mov ah, 0x00; int 0xF1                            ; GRP600C census call
+  // loop_poll:
+  //   mov ax, 0x0003; int 0x33                          ; mouse status poll
+  //   mov ah, 0x01; int 0x16                            ; kbhit peek
+  //   jz loop_poll
+  //   mov ah, 0x00; int 0x16                            ; consume key
+  //   cmp al, 'q'; jne loop_poll
+  //   mov ax, 0x4C00; int 0x21                          ; exit 0
+  static constexpr std::uint8_t kHeadlessGuestCom[] = {
+      0xB8, 0x02, 0x4F, 0xBB, 0x02, 0x01, 0xCD, 0x10,
+      0xB8, 0x00, 0xA0, 0x8E, 0xC0, 0x26, 0xC6, 0x06, 0x00, 0x00, 0xFF,
+      0xBA, 0x88, 0x03, 0xB0, 0x20, 0xEE, 0x42, 0xB0, 0x01, 0xEE,
+      0xB4, 0x00, 0xCD, 0xF1,
+      0xB8, 0x03, 0x00, 0xCD, 0x33,
+      0xB4, 0x01, 0xCD, 0x16,
+      0x74, 0xF5,
+      0xB4, 0x00, 0xCD, 0x16,
+      0x3C, 'q', 0x75, 0xED,
+      0xB8, 0x00, 0x4C, 0xCD, 0x21,
+  };
+  write_binary_file_checked(game_dir / "SAN486.COM", kHeadlessGuestCom);
+
+  const auto shot_png = tmp.path() / "shot.png";
+  const auto prof_tsv = tmp.path() / "profile.tsv";
+
+  san4::HostOptions opts;
+  opts.game_dir = game_dir;
+  opts.hd_pack_dir = hd_dir;
+  opts.upscale_mode = san4::UpscaleMode::Nearest;
+  opts.explicit_scale = true;
+  opts.deterministic = true;
+  opts.threads = 2;
+  opts.profile_frames_path = prof_tsv;
+  opts.headless_script =
+      "frames:2;wait_idle:4;wait_ms:20;move:120:140;click:150:160;"
+      "rclick:170:180;tap:190:200;wheel:2;wheel:-2;shift_wheel:1;"
+      "shift_wheel:-1;key:enter;key:esc;key:space;key:up;key:down;"
+      "key:left;key:right;key:pgup;key:pgdn;key:1;speed:2;speed:4;speed:1;"
+      "scale:sharp2x;scale:scale2x;scale:xbr2x;scale:nearest;"
+      "reload_hd;reload_hd:" +
+      san4::util::path_to_utf8(hd_dir) + ";screenshot:" +
+      san4::util::path_to_utf8(shot_png) +
+      ";reset_audio_peak;stats;key:q;quit";
+
+  {
+    san4::SdlHost host(opts);
+    CHECK(host.run() == 0);
+  }
+  int sw = 0;
+  int sh = 0;
+  std::vector<std::uint32_t> spx;
+  CHECK(san4::HdPackManager::load_argb_png(shot_png, sw, sh, spx));
+  CHECK(sw == 800 && sh == 600);
+  CHECK(std::filesystem::file_size(prof_tsv) > 64u);
+
+  // Invalid headless script commands must return 2 cleanly.
+  opts.profile_frames_path.clear();
+  opts.headless_script = "bogus_op:123";
+  {
+    san4::SdlHost bad_host(opts);
+    CHECK(bad_host.run() == 2);
+
+    bool running = true;
+    bool force_full = false;
+    static const std::vector<std::vector<std::string>> kBadCmds = {
+        {"frames"},
+        {"frames", "0"},
+        {"wait_idle", "0"},
+        {"wait_idle", "1", "2"},
+        {"wait_ms"},
+        {"wait_ms", "-1"},
+        {"move", "10"},
+        {"click", "bad", "10"},
+        {"tap", "10"},
+        {"wheel"},
+        {"key"},
+        {"key", "invalidkey"},
+        {"speed", "3"},
+        {"scale", "badmode"},
+        {"screenshot"},
+        {"reset_audio_peak", "extra"},
+        {"stats", "extra"},
+        {"quit", "extra"},
+    };
+    for (const auto& cmd : kBadCmds) {
+      CHECK(!san4::SdlHostTestPeer::execute_headless_command(
+          bad_host, cmd, running, force_full));
+    }
+  }
+}
+
+void test_sdl_host_interactive_events_audio_and_present_slot() {
+  ScopedEnvVar vid_drv("SDL_VIDEODRIVER", "dummy");
+  ScopedEnvVar aud_drv("SDL_AUDIODRIVER", "dummy");
+
+  ScopedTempDir tmp;
+  const auto game_dir = tmp.path() / "game";
+  const auto dump_dir = tmp.path() / "dump";
+  const auto prof_tsv = tmp.path() / "interactive_prof.tsv";
+  std::filesystem::create_directories(game_dir);
+
+  // 1) Interactive SdlHost::run() end-to-end: guest warps cursor (AX=0004h),
+  //    defines 16x16 graphics cursor (AX=0009h), yields 2 BIOS polls so main
+  //    thread acquires & presents a FrameMailbox slot, and exits cleanly!
+  {
+    static constexpr std::uint8_t kInteractiveGuestCom[] = {
+        0xB8, 0x02, 0x4F, 0xBB, 0x02, 0x01, 0xCD, 0x10,  // VESA 0x0102
+        0xB8, 0x04, 0x00, 0xB9, 0x90, 0x01, 0xBA, 0x2C, 0x01, 0xCD, 0x33,  // warp (400,300)
+        0x8C, 0xC8, 0x8E, 0xC0,                          // push cs -> es
+        0xB8, 0x09, 0x00, 0xBB, 0x02, 0x00, 0xB9, 0x03, 0x00,
+        0xBA, 0x40, 0x01, 0xCD, 0x33,                    // cursor mask at CS:0140
+        0xBF, 0x06, 0x00,                                // 6 idle polls (~3 frames)
+        0xB8, 0x03, 0x00, 0xCD, 0x33,
+        0x4F, 0x75, 0xF8,
+        0xB8, 0x00, 0x4C, 0xCD, 0x21,                    // exit 0
+    };
+    std::vector<std::uint8_t> com_buf(0x0100u, 0x90u);
+    std::memcpy(com_buf.data(), kInteractiveGuestCom,
+                sizeof(kInteractiveGuestCom));
+    for (std::size_t i = 0; i < 32u; ++i) {
+      com_buf[0x40u + i] = 0x00u;         // AND mask = 0 (opaque)
+      com_buf[0x60u + i] = (i & 1u) ? 0xFFu : 0xAAu;  // XOR mask
+    }
+    write_binary_file_checked(game_dir / "SAN486.COM", com_buf);
+
+    san4::HostOptions opts;
+    opts.game_dir = game_dir;
+    opts.upscale_mode = san4::UpscaleMode::Nearest;
+    opts.explicit_scale = true;
+    opts.window_scale = 1;
+    opts.threads = 2;
+    opts.profile_frames_path = prof_tsv;
+    san4::SdlHost host(opts);
+    CHECK(host.run() == 0);
+    CHECK(std::filesystem::exists(prof_tsv));
+  }
+
+  // 2) Deterministic unit exercise of interactive event dispatch, coordinate
+  //    mapping, audio callback, sparse vs full-frame texture upload, and resets.
+  {
+    const auto hd_dir = tmp.path() / "hd";
+    std::filesystem::create_directories(hd_dir);
+    san4::HostOptions opts;
+    opts.game_dir = game_dir;
+    opts.hd_pack_dir = hd_dir;
+    opts.dump_sprites_dir = dump_dir;
+    opts.window_scale = 2;
+    opts.threads = 2;
+    san4::SdlHost host(opts);
+
+    // Exercise sdl_audio_callback directly BEFORE init_sdl() spawns SDL's
+    // background audio consumer thread (respecting Opl2Audio's SPSC contract!).
+    san4::X86Machine& m = san4::SdlHostTestPeer::machine(host);
+    m.audio().advance_seconds(0.060);
+    std::vector<std::uint8_t> pcm(2300u * 4u + 3u, 0x7Fu);
+    san4::SdlHostTestPeer::audio_callback(nullptr, pcm.data(), 64);
+    san4::SdlHostTestPeer::audio_callback(&host, nullptr, 64);
+    san4::SdlHostTestPeer::audio_callback(&host, pcm.data(), 0);
+    san4::SdlHostTestPeer::audio_callback(
+        &host, pcm.data(), static_cast<int>(pcm.size()));
+    CHECK(pcm.back() == 0u);  // trailing odd bytes zero-filled!
+
+    CHECK(san4::SdlHostTestPeer::init_sdl(host));
+
+    // Coordinate helpers (including degenerate zero-dimension fallbacks).
+    const auto clamped_big =
+        san4::SdlHostTestPeer::clamp_initial_window_size(3200, 2400, 1920, 1080);
+    CHECK(clamped_big.w <= 1920 && clamped_big.h <= 1080);
+    const auto clamped_zero =
+        san4::SdlHostTestPeer::clamp_initial_window_size(1600, 1200, 0, 0);
+    CHECK(clamped_zero.w == 1600 && clamped_zero.h == 1200);
+
+    int dx = 0, dy = 0, wx = 0, wy = 0;
+    san4::SdlHostTestPeer::map_window_to_dos(400, 300, 0, 0, 0, 0, 800, 600, dx,
+                                             dy);
+    CHECK(dx == 400 && dy == 300);
+    san4::SdlHostTestPeer::map_dos_to_window(400, 300, 0, 0, 0, 0, 800, 600, wx,
+                                             wy);
+    CHECK(wx >= 399 && wx <= 401 && wy >= 299 && wy <= 301);
+    san4::SdlHostTestPeer::dos_to_window_coords(host, 200, 150, 800, 600, wx, wy);
+    san4::SdlHostTestPeer::window_to_dos_coords(host, wx, wy, dx, dy);
+    CHECK(std::abs(dx - 200) <= 2 && std::abs(dy - 150) <= 2);
+
+    // Upload rects: sparse (<60%) vs dense (>60%) full-frame upload + present_slot.
+    std::vector<std::uint32_t> argb(1600u * 1200u, 0xFF112233u);
+    const san4::UpscaleDirtyRect small_r{
+        .has_changes = true, .x = 0, .y = 0, .w = 32, .h = 32};
+    CHECK(san4::SdlHostTestPeer::upload_rects(
+              host, argb.data(),
+              std::span<const san4::UpscaleDirtyRect>(&small_r, 1u)) ==
+          32u * 32u);
+    const san4::UpscaleDirtyRect big_r{
+        .has_changes = true, .x = 0, .y = 0, .w = 1600, .h = 900};
+    CHECK(san4::SdlHostTestPeer::upload_rects(
+              host, argb.data(),
+              std::span<const san4::UpscaleDirtyRect>(&big_r, 1u)) ==
+          1600u * 1200u);
+
+    san4::FrameMailbox::Slot slot;
+    slot.gen = 1u;
+    slot.w = 800;
+    slot.h = 600;
+    slot.mode = san4::UpscaleMode::Nearest;
+    slot.argb.assign(800u * 600u, 0xFF334455u);
+    slot.status.mode = san4::UpscaleMode::Nearest;
+    slot.status.speed_multiplier = 2;
+    slot.status.hd_loaded = 5u;
+    slot.status.hd_dumping = true;
+    slot.tile_gen.fill(1u);
+    CHECK(san4::SdlHostTestPeer::present_slot(host, slot));
+
+    // Push synthetic SDL events covering hotkeys, keys, mouse, wheel, window,
+    // audio hotplug, render resets, and SDL_QUIT!
+    auto push_key_ev = [](Uint32 type, SDL_Keycode sym, Uint16 mod = 0) {
+      SDL_Event e{};
+      e.type = type;
+      e.key.keysym.sym = sym;
+      e.key.keysym.mod = mod;
+      SDL_PushEvent(&e);
+    };
+    static constexpr SDL_Keycode kTestKeys[] = {
+        SDLK_TAB,      SDLK_F4,       SDLK_F5,     SDLK_F8,     SDLK_F9,
+        SDLK_F11,      SDLK_w,        SDLK_a,      SDLK_s,      SDLK_d,
+        SDLK_RETURN,   SDLK_ESCAPE,   SDLK_SPACE,  SDLK_BACKSPACE,
+        SDLK_UP,       SDLK_DOWN,     SDLK_LEFT,   SDLK_RIGHT,  SDLK_PAGEUP,
+        SDLK_PAGEDOWN, SDLK_HOME,     SDLK_END,    SDLK_F1,     SDLK_F2,
+        SDLK_F3,       SDLK_F6,       SDLK_F7,     SDLK_F10,    SDLK_0,
+        SDLK_5,        SDLK_MINUS,    SDLK_EQUALS, SDLK_LEFTBRACKET,
+        SDLK_RIGHTBRACKET, SDLK_SEMICOLON, SDLK_QUOTE, SDLK_BACKQUOTE,
+        SDLK_BACKSLASH, SDLK_COMMA,   SDLK_PERIOD, SDLK_SLASH,
+    };
+    for (SDL_Keycode k : kTestKeys) {
+      push_key_ev(SDL_KEYDOWN, k, 0);
+    }
+    push_key_ev(SDL_KEYDOWN, SDLK_RETURN, KMOD_ALT);
+    for (char ch = 'a'; ch <= 'z'; ++ch) {
+      push_key_ev(SDL_KEYDOWN, static_cast<SDL_Keycode>(ch), KMOD_SHIFT);
+    }
+    push_key_ev(SDL_KEYUP, SDLK_TAB, 0);
+
+    {
+      SDL_Event e{};
+      e.type = SDL_MOUSEMOTION;
+      e.motion.x = 120;
+      e.motion.y = 90;
+      SDL_PushEvent(&e);
+
+      for (Uint8 btn : {SDL_BUTTON_LEFT, SDL_BUTTON_RIGHT, SDL_BUTTON_MIDDLE}) {
+        e = SDL_Event{};
+        e.type = SDL_MOUSEBUTTONDOWN;
+        e.button.button = btn;
+        e.button.x = 100;
+        e.button.y = 100;
+        SDL_PushEvent(&e);
+        e.type = SDL_MOUSEBUTTONUP;
+        SDL_PushEvent(&e);
+      }
+
+      e = SDL_Event{};
+      e.type = SDL_MOUSEWHEEL;
+      e.wheel.y = 2;
+      e.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+      SDL_PushEvent(&e);
+      e.wheel.y = 2;
+      e.wheel.direction = SDL_MOUSEWHEEL_FLIPPED;
+      SDL_PushEvent(&e);
+
+      e = SDL_Event{};
+      e.type = SDL_WINDOWEVENT;
+      e.window.event = SDL_WINDOWEVENT_RESIZED;
+      SDL_PushEvent(&e);
+      e.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
+      SDL_PushEvent(&e);
+
+      if (const auto adev = san4::SdlHostTestPeer::audio_dev(host); adev != 0u) {
+        e = SDL_Event{};
+        e.type = SDL_AUDIODEVICEREMOVED;
+        e.adevice.iscapture = 0;
+        e.adevice.which = adev;
+        SDL_PushEvent(&e);
+
+        e = SDL_Event{};
+        e.type = SDL_AUDIODEVICEADDED;
+        e.adevice.iscapture = 0;
+        SDL_PushEvent(&e);
+      }
+
+      e = SDL_Event{};
+      e.type = SDL_RENDER_TARGETS_RESET;
+      SDL_PushEvent(&e);
+      e.type = SDL_RENDER_DEVICE_RESET;
+      SDL_PushEvent(&e);
+
+      e = SDL_Event{};
+      e.type = SDL_QUIT;
+      SDL_PushEvent(&e);
+    }
+
+    bool running = true;
+    san4::SdlHostTestPeer::process_events(host, running);
+    CHECK(!running);
+    CHECK(san4::SdlHostTestPeer::recreate_renderer_after_reset(host));
+  }
+}
+
+void test_audio_pit_ch2_speaker_opl3_and_underrun_decay() {
+  san4::Opl2Audio audio;
+  CHECK(audio.handles_port(0x0388u) && audio.handles_port(0x0222u) &&
+        audio.handles_port(0x0042u) && audio.handles_port(0x0061u) &&
+        !audio.handles_port(0x03DAu));
+
+  // 1) PIT channel 2 control modes (non-ch2 ignored, rl=1 LSB, rl=2 MSB, rl=3 LSB+MSB + latch).
+  audio.on_pit_control(0x36u);  // ch0 ignored
+  audio.on_pit_control(0x90u);  // ch2, rl=1 (LSB only)
+  audio.port_out8(0x0042u, 0x00u);  // 0 -> 65536
+  CHECK(audio.port_in8(0x0042u) == 0x00u);
+  audio.port_out8(0x0042u, 0x34u);
+  CHECK(audio.port_in8(0x0042u) == 0x34u);
+
+  audio.on_pit_control(0xA0u);  // ch2, rl=2 (MSB only)
+  audio.port_out8(0x0042u, 0x00u);
+  CHECK(audio.port_in8(0x0042u) == 0x00u);
+  audio.port_out8(0x0042u, 0x12u);
+  CHECK(audio.port_in8(0x0042u) == 0x12u);
+
+  audio.on_pit_control(0xB6u);  // ch2, rl=3 (LSB then MSB)
+  audio.port_out8(0x0042u, 0x78u);
+  audio.port_out8(0x0042u, 0x56u);
+  audio.on_pit_control(0x80u);  // latch 0x5678
+  audio.on_pit_control(0x80u);  // second latch while latched is ignored
+  CHECK(audio.port_in8(0x0042u) == 0x78u);
+  CHECK(audio.port_in8(0x0042u) == 0x56u);
+
+  // 2) Port 0x61 refresh toggle + PC speaker soft-envelope ramp up & down.
+  audio.port_out8(0x0061u, 0x03u);
+  const std::uint8_t p61_a = audio.port_in8(0x0061u);
+  const std::uint8_t p61_b = audio.port_in8(0x0061u);
+  CHECK(((p61_a ^ p61_b) & 0x10u) == 0x10u);
+  audio.reset_peak_abs_sample();
+  audio.advance_seconds(0.015);
+  audio.port_out8(0x0061u, 0x00u);
+  audio.advance_seconds(0.010);
+  CHECK(audio.peak_abs_sample() > 0);
+
+  // 3) Sound Blaster mirror ports (0x220..0x223), Timer 2 expiry/mask/reset, & OPL3 stereo.
+  audio.port_out8(0x0220u, 0x04u);
+  audio.port_out8(0x0221u, 0x80u);  // IRQ reset
+  CHECK(audio.port_in8(0x0220u) == 0x00u);
+
+  // Masked Timer 1 & Timer 2 must not assert expiry bits.
+  audio.port_out8(0x0220u, 0x02u);
+  audio.port_out8(0x0221u, 0xFFu);
+  audio.port_out8(0x0220u, 0x03u);
+  audio.port_out8(0x0221u, 0xFFu);
+  audio.port_out8(0x0220u, 0x04u);
+  audio.port_out8(0x0221u, 0x63u);  // start T1+T2 with both masked (0x40|0x20)
+  audio.advance_seconds(0.005);
+  CHECK(audio.port_in8(0x0220u) == 0x00u);
+
+  // Unmasked Timer 2 expiry sets 0xA0 (IRQ | T2); 0x80 resets it.
+  audio.port_out8(0x0220u, 0x04u);
+  audio.port_out8(0x0221u, 0x00u);
+  audio.port_out8(0x0220u, 0x04u);
+  audio.port_out8(0x0221u, 0x02u);  // start T2 unmasked
+  audio.advance_seconds(0.002);
+  CHECK((audio.port_in8(0x0222u) & 0xA0u) == 0xA0u);
+  audio.port_out8(0x0388u, 0x04u);
+  audio.port_out8(0x0389u, 0x80u);
+  CHECK(audio.port_in8(0x0388u) == 0x00u);
+
+  // Enable OPL3 mode via bank 1 register 0x105 = 0x01 and render stereo block.
+  audio.port_out8(0x0222u, 0x05u);
+  audio.port_out8(0x0223u, 0x01u);
+  audio.advance_seconds(0.010);
+
+  // 4) Non-positive / NaN advance guards, ring cap, and underrun smooth decay.
+  const std::uint64_t before_frames = audio.total_rendered_frames();
+  audio.advance_seconds(0.0);
+  audio.advance_seconds(-0.5);
+  audio.advance_seconds(std::numeric_limits<double>::quiet_NaN());
+  CHECK(audio.total_rendered_frames() == before_frames);
+
+  audio.advance_seconds(0.250);
+  audio.advance_seconds(0.250);
+  audio.advance_seconds(0.250);
+  CHECK(audio.buffered_frames() <= san4::Opl2Audio::kMaxBufferedFrames);
+
+  std::vector<std::int16_t> drain_buf(
+      (san4::Opl2Audio::kMaxBufferedFrames + 128u) * 2u, 0);
+  const std::uint32_t got = audio.pull_stereo_s16(
+      drain_buf.data(), san4::Opl2Audio::kMaxBufferedFrames + 128u);
+  CHECK(got <= san4::Opl2Audio::kMaxBufferedFrames);
+  CHECK(audio.buffered_frames() == 0u);
+}
+
+void test_ems_4_0_complete_subfunctions_and_error_codes() {
+  ScopedTempDir tmp;
+  san4::MachineConfig cfg;
+  cfg.game_dir = tmp.path();
+  san4::X86Machine m(cfg);
+  x86emu_t* emu = m.emu();
+  x86emu_set_seg_register(emu, emu->x86.R_DS_SEL, 0x2000u);
+  x86emu_set_seg_register(emu, emu->x86.R_ES_SEL, 0x2100u);
+
+  // AH=40h Status, 41h Page Frame, 42h Page Counts, 46h Version
+  emu->x86.R_AH = 0x40u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  emu->x86.R_AH = 0x41u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_BX == 0xD000u);
+
+  emu->x86.R_AH = 0x42u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_DX == 256u &&
+        emu->x86.R_BX == 256u);
+
+  emu->x86.R_AH = 0x46u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_AL == 0x40u);
+
+  // AH=43h error cases: 0 pages (0x89), > free pages (0x88), then allocate 2 pages.
+  emu->x86.R_AH = 0x43u;
+  emu->x86.R_BX = 0u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x89u);
+
+  emu->x86.R_AH = 0x43u;
+  emu->x86.R_BX = 300u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x88u);
+
+  emu->x86.R_AH = 0x43u;
+  emu->x86.R_BX = 2u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+  const std::uint16_t h1 = emu->x86.R_DX;
+
+  // AH=44h errors (AL>=4 -> 0x8B, bad handle -> 0x83, bad page -> 0x8A) & valid map.
+  emu->x86.R_AX = 0x4404u;
+  emu->x86.R_DX = h1;
+  emu->x86.R_BX = 0u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Bu);
+
+  emu->x86.R_AX = 0x4400u;
+  emu->x86.R_DX = 99u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x83u);
+
+  emu->x86.R_AX = 0x4400u;
+  emu->x86.R_DX = h1;
+  emu->x86.R_BX = 5u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Au);
+
+  emu->x86.R_AX = 0x4400u;
+  emu->x86.R_DX = h1;
+  emu->x86.R_BX = 0u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  // AH=47h / 48h Save & Restore Page Map (+ duplicate 0x8D, missing 0x8E, bad handle 0x83).
+  emu->x86.R_AH = 0x47u;
+  emu->x86.R_DX = 99u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x83u);
+
+  emu->x86.R_AH = 0x48u;
+  emu->x86.R_DX = h1;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Eu);
+
+  emu->x86.R_AH = 0x47u;
+  emu->x86.R_DX = h1;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  emu->x86.R_AH = 0x47u;
+  emu->x86.R_DX = h1;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Du);
+
+  emu->x86.R_AX = 0x4400u;
+  emu->x86.R_DX = h1;
+  emu->x86.R_BX = 0xFFFFu;  // unmap slot 0
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  emu->x86.R_AH = 0x48u;
+  emu->x86.R_DX = 99u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x83u);
+
+  emu->x86.R_AH = 0x48u;
+  emu->x86.R_DX = h1;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  // AH=4Bh Handle Count, 4Ch Handle Pages, 4Dh All Handle Pages.
+  emu->x86.R_AH = 0x4Bu;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_BX >= 2u);
+
+  emu->x86.R_AH = 0x4Cu;
+  emu->x86.R_DX = 99u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x83u);
+
+  emu->x86.R_AH = 0x4Cu;
+  emu->x86.R_DX = h1;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_BX == 2u);
+
+  emu->x86.R_AH = 0x4Du;
+  emu->x86.R_DI = 0x0000u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_BX >= 2u);
+
+  // AH=4Eh Get/Set Page Map (AL=03h size=16, AL=04h->0x8F, AL=00h/02h/01h + corrupt 0xA3).
+  emu->x86.R_AX = 0x4E03u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_AL == 16u);
+
+  emu->x86.R_AX = 0x4E04u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Fu);
+
+  emu->x86.R_AX = 0x4E00u;
+  emu->x86.R_DI = 0x0100u;  // ES:0100
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  std::memcpy(m.guest_ram() + 0x20200u, m.guest_ram() + 0x21100u, 16u);
+  emu->x86.R_AX = 0x4E02u;
+  emu->x86.R_SI = 0x0200u;
+  emu->x86.R_DI = 0x0120u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  // Corrupt entry (-5) -> 0xA3
+  const std::int32_t bad_pg = -5;
+  std::memcpy(m.guest_ram() + 0x20210u, &bad_pg, 4u);
+  emu->x86.R_AX = 0x4E01u;
+  emu->x86.R_SI = 0x0210u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0xA3u);
+
+  // AH=50h Map Multiple Pages (AL=00h slot indices, AL=01h segment addresses, + errors).
+  emu->x86.R_AX = 0x5002u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Fu);
+
+  emu->x86.R_AX = 0x5000u;
+  emu->x86.R_DX = 99u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x83u);
+
+  auto write_u16 = [&](std::uint32_t lin, std::uint16_t v) {
+    m.guest_ram()[lin + 0u] = static_cast<std::uint8_t>(v & 0xFFu);
+    m.guest_ram()[lin + 1u] = static_cast<std::uint8_t>(v >> 8);
+  };
+  write_u16(0x20300u, 0u);
+  write_u16(0x20302u, 0xD000u);
+  write_u16(0x20304u, 1u);
+  write_u16(0x20306u, 0xD400u);
+  emu->x86.R_AX = 0x5001u;
+  emu->x86.R_DX = h1;
+  emu->x86.R_CX = 2u;
+  emu->x86.R_SI = 0x0300u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  write_u16(0x20302u, 0xD123u);  // misaligned segment -> 0x8B
+  emu->x86.R_AX = 0x5001u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Bu);
+
+  // AH=52h Handle Attribute, 53h Get/Set Handle Name, 58h Physical Address Array.
+  emu->x86.R_AX = 0x5200u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_AL == 0x00u);
+  emu->x86.R_AX = 0x5201u;
+  emu->x86.R_BL = 0x00u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+  emu->x86.R_AX = 0x5201u;
+  emu->x86.R_BL = 0x01u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x91u);
+
+  std::memcpy(m.guest_ram() + 0x20400u, "OVERLAY1", 8u);
+  emu->x86.R_AX = 0x5301u;
+  emu->x86.R_DX = h1;
+  emu->x86.R_SI = 0x0400u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  emu->x86.R_AX = 0x5300u;
+  emu->x86.R_DX = h1;
+  emu->x86.R_DI = 0x0420u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+  CHECK(std::memcmp(m.guest_ram() + 0x21420u, "OVERLAY1", 8u) == 0);
+
+  emu->x86.R_AX = 0x5302u;
+  emu->x86.R_DX = h1;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Fu);
+  emu->x86.R_AX = 0x5300u;
+  emu->x86.R_DX = 99u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x83u);
+
+  emu->x86.R_AX = 0x5800u;
+  emu->x86.R_DI = 0x0500u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_CX == 4u);
+  emu->x86.R_AX = 0x5801u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u && emu->x86.R_CX == 4u);
+  emu->x86.R_AX = 0x5802u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Fu);
+
+  // AH=57h Exchange (AL=01h) & error branches (length=0, >1MB 0x96, bad type 0x98,
+  // off>=16K 0x95, >cap 0x93, overlapping exchange 0x97, overlapping EMS move 0x92).
+  auto set_57_desc = [&](std::uint32_t len, std::uint8_t st, std::uint16_t sh,
+                         std::uint16_t so, std::uint16_t ssp, std::uint8_t dt,
+                         std::uint16_t dh, std::uint16_t doff,
+                         std::uint16_t dsp) {
+    std::uint8_t* d = m.guest_ram() + 0x20600u;
+    std::memcpy(d + 0u, &len, 4u);
+    d[4u] = st;
+    write_u16(0x20605u, sh);
+    write_u16(0x20607u, so);
+    write_u16(0x20609u, ssp);
+    d[11u] = dt;
+    write_u16(0x2060Cu, dh);
+    write_u16(0x2060Eu, doff);
+    write_u16(0x20610u, dsp);
+    emu->x86.R_SI = 0x0600u;
+  };
+  emu->x86.R_AX = 0x5702u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x8Fu);
+
+  set_57_desc(0u, 0u, 0u, 0u, 0x2200u, 0u, 0u, 0x10u, 0x2200u);
+  emu->x86.R_AX = 0x5700u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  set_57_desc(0x200000u, 0u, 0u, 0u, 0x2200u, 0u, 0u, 0u, 0x2300u);
+  emu->x86.R_AX = 0x5700u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x96u);
+
+  set_57_desc(16u, 2u, 0u, 0u, 0x2200u, 0u, 0u, 0u, 0x2300u);
+  emu->x86.R_AX = 0x5700u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x98u);
+
+  set_57_desc(16u, 1u, h1, 0x4000u, 0u, 0u, 0u, 0u, 0x2300u);
+  emu->x86.R_AX = 0x5700u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x95u);
+
+  set_57_desc(16u, 1u, h1, 0x3FF8u, 1u, 0u, 0u, 0u, 0x2300u);
+  emu->x86.R_AX = 0x5700u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x93u);
+
+  // Non-overlapping exchange (AL=01h) swaps conventional [0x22000] <-> [0x22100].
+  std::memcpy(m.guest_ram() + 0x22000u, "AAAAAAAA", 8u);
+  std::memcpy(m.guest_ram() + 0x22100u, "BBBBBBBB", 8u);
+  set_57_desc(8u, 0u, 0u, 0u, 0x2200u, 0u, 0u, 0x0100u, 0x2200u);
+  emu->x86.R_AX = 0x5701u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+  CHECK(std::memcmp(m.guest_ram() + 0x22000u, "BBBBBBBB", 8u) == 0);
+  CHECK(std::memcmp(m.guest_ram() + 0x22100u, "AAAAAAAA", 8u) == 0);
+
+  // Overlapping exchange -> 0x97; overlapping EMS<->EMS move -> 0x92.
+  set_57_desc(8u, 0u, 0u, 0u, 0x2200u, 0u, 0u, 4u, 0x2200u);
+  emu->x86.R_AX = 0x5701u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x97u);
+
+  set_57_desc(16u, 1u, h1, 0u, 0u, 1u, h1, 4u, 0u);
+  emu->x86.R_AX = 0x5700u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x92u);
+
+  // Exhaust remaining handles (62 more -> 0x85 on 64th), then deallocate all.
+  std::vector<std::uint16_t> extra_handles;
+  for (int i = 0; i < 62; ++i) {
+    emu->x86.R_AH = 0x43u;
+    emu->x86.R_BX = 1u;
+    m.ems().handle_int67(emu);
+    CHECK(emu->x86.R_AH == 0x00u);
+    extra_handles.push_back(emu->x86.R_DX);
+  }
+  emu->x86.R_AH = 0x43u;
+  emu->x86.R_BX = 1u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x85u);
+
+  for (std::uint16_t eh : extra_handles) {
+    emu->x86.R_AH = 0x45u;
+    emu->x86.R_DX = eh;
+    m.ems().handle_int67(emu);
+    CHECK(emu->x86.R_AH == 0x00u);
+  }
+  emu->x86.R_AH = 0x45u;
+  emu->x86.R_DX = 0u;  // OS handle 0 cannot be freed -> 0x83
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x83u);
+
+  emu->x86.R_AH = 0x45u;
+  emu->x86.R_DX = h1;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x00u);
+
+  emu->x86.R_AH = 0x99u;
+  m.ems().handle_int67(emu);
+  CHECK(emu->x86.R_AH == 0x84u);
+}
+
+void test_mouse_hle_complete_int33_contract() {
+  ScopedTempDir tmp;
+  san4::MachineConfig cfg;
+  cfg.game_dir = tmp.path();
+  san4::X86Machine m(cfg);
+  x86emu_t* emu = m.emu();
+  bool poll = false;
+
+  int cursor_notifications = 0;
+  int warps = 0;
+  int last_warp_x = -1;
+  int last_warp_y = -1;
+  m.mouse().set_cursor_callback(
+      [&](const san4::DosCursorShape&, bool) { ++cursor_notifications; });
+  m.mouse().set_warp_callback([&](int wx, int wy) {
+    ++warps;
+    last_warp_x = wx;
+    last_warp_y = wy;
+  });
+
+  // AX=0021h software reset
+  emu->x86.R_AX = 0x0021u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(emu->x86.R_AX == 0xFFFFu && emu->x86.R_BX == 3u && !poll);
+
+  // Hide depth: reset() starts at 1 (DOS INT 33h spec: hidden until AX=0001h);
+  // AX=0002h + AX=0010h raise depth to 3, so three AX=0001h calls reveal it.
+  emu->x86.R_AX = 0x0002u;
+  m.mouse().handle_int33(emu, poll);
+  emu->x86.R_AX = 0x0010u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(!m.mouse().cursor_visible());
+  const int before_show = cursor_notifications;
+  emu->x86.R_AX = 0x0001u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(!m.mouse().cursor_visible());
+  emu->x86.R_AX = 0x0001u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(!m.mouse().cursor_visible());
+  emu->x86.R_AX = 0x0001u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(m.mouse().cursor_visible() && cursor_notifications == before_show + 1);
+
+  // AX=0007h / 0008h swapped bounds & legacy 639/479 full-screen promotion.
+  emu->x86.R_AX = 0x0007u;
+  emu->x86.R_CX = 0u;
+  emu->x86.R_DX = 639u;
+  m.mouse().handle_int33(emu, poll);
+  emu->x86.R_AX = 0x0008u;
+  emu->x86.R_CX = 0u;
+  emu->x86.R_DX = 479u;
+  m.mouse().handle_int33(emu, poll);
+  m.mouse().set_position(790, 590);
+  CHECK(m.mouse().x() == 790 && m.mouse().y() == 590);
+
+  emu->x86.R_AX = 0x0007u;
+  emu->x86.R_CX = 500u;
+  emu->x86.R_DX = 100u;  // reversed -> [100, 500]
+  m.mouse().handle_int33(emu, poll);
+  emu->x86.R_AX = 0x0008u;
+  emu->x86.R_CX = 400u;
+  emu->x86.R_DX = 50u;   // reversed -> [50, 400]
+  m.mouse().handle_int33(emu, poll);
+  CHECK(m.mouse().x() == 500 && m.mouse().y() == 400);
+
+  // AX=0004h warp clamping
+  emu->x86.R_AX = 0x0004u;
+  emu->x86.R_CX = 250u;
+  emu->x86.R_DX = 180u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(warps == 1 && last_warp_x == 250 && last_warp_y == 180);
+
+  // AX=0005h / 0006h button press & release data (valid + out-of-range BX>=3).
+  m.mouse().set_button(1, true);
+  m.mouse().set_button(1, false);
+  emu->x86.R_AX = 0x0005u;
+  emu->x86.R_BX = 5u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(emu->x86.R_BX == 0u && emu->x86.R_CX == 0u);
+  emu->x86.R_AX = 0x0005u;
+  emu->x86.R_BX = 1u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(emu->x86.R_BX == 1u && emu->x86.R_CX == 250u && emu->x86.R_DX == 180u);
+
+  emu->x86.R_AX = 0x0006u;
+  emu->x86.R_BX = 5u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(emu->x86.R_BX == 0u);
+  emu->x86.R_AX = 0x0006u;
+  emu->x86.R_BX = 1u;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(emu->x86.R_BX == 1u && emu->x86.R_CX == 250u && emu->x86.R_DX == 180u);
+
+  // AX=0009h 16x16 graphics cursor: row 0 tests all 4 (AND, XOR) bit pairs!
+  x86emu_set_seg_register(emu, emu->x86.R_ES_SEL, 0x2000u);
+  // Bit 15: AND=1,XOR=0 (transparent); Bit 14: AND=0,XOR=0 (black);
+  // Bit 13: AND=0,XOR=1 (white);       Bit 12: AND=1,XOR=1 (inverted)
+  const std::uint16_t and0 = 0x9000u;
+  const std::uint16_t xor0 = 0x3000u;
+  std::memcpy(m.guest_ram() + 0x20000u, &and0, 2u);
+  std::memcpy(m.guest_ram() + 0x20020u, &xor0, 2u);
+  emu->x86.R_AX = 0x0009u;
+  emu->x86.R_BX = 4u;
+  emu->x86.R_CX = 5u;
+  emu->x86.R_DX = 0x0000u;
+  m.mouse().handle_int33(emu, poll);
+  const auto& cs = m.mouse().cursor_shape();
+  CHECK(cs.hot_x == 4 && cs.hot_y == 5);
+  CHECK(cs.argb[0] == 0x00000000u);
+  CHECK(cs.argb[1] == 0xFF000000u);
+  CHECK(cs.argb[2] == 0xFFFFFFFFu);
+  CHECK(cs.argb[3] == 0xFF202020u);
+
+  // AX=000Bh mickey counters & stubbed functions (000Ch, 000Fh, 0012h, 001Ah, 0028h, 00FFh).
+  m.mouse().set_position(260, 195);
+  emu->x86.R_AX = 0x000Bu;
+  m.mouse().handle_int33(emu, poll);
+  CHECK(emu->x86.R_CX == 20u && emu->x86.R_DX == 30u);
+
+  for (std::uint16_t fn :
+       {0x000Cu, 0x000Fu, 0x0012u, 0x001Au, 0x0028u, 0x00FFu, 0x0099u}) {
+    emu->x86.R_AX = fn;
+    m.mouse().handle_int33(emu, poll);
+    if (fn == 0x0028u) {
+      CHECK(emu->x86.R_AX == 0x0000u);
+    }
+  }
+}
+
+void test_dos_kernel_console_ioctl_tsr_and_video_bios_ports() {
+  ScopedTempDir tmp;
+  const auto game_dir = tmp.path() / "game";
+  const auto save_dir = tmp.path() / "save";
+  const auto hd_dir = tmp.path() / "hd";
+  std::filesystem::create_directories(game_dir);
+  std::filesystem::create_directories(save_dir);
+  std::filesystem::create_directories(hd_dir / "cg");
+
+  {
+    std::ofstream f(game_dir / "ATTRTEST.DAT", std::ios::binary);
+    f << "hello";
+  }
+
+  san4::MachineConfig cfg;
+  cfg.game_dir = game_dir;
+  cfg.save_dir = save_dir;
+  san4::X86Machine m(cfg);
+  x86emu_t* emu = m.emu();
+  x86emu_set_seg_register(emu, emu->x86.R_DS_SEL, 0x2000u);
+  x86emu_set_seg_register(emu, emu->x86.R_ES_SEL, 0x2100u);
+
+  // 1) Const X86Machine accessors (machine.h) & BIOS interrupts 11h, 12h, 13h, 15h, 1Ah.
+  {
+    const san4::X86Machine& cm = m;
+    CHECK(cm.emu() != nullptr);
+    CHECK(cm.video().active_width() > 0);
+    CHECK(cm.audio().buffered_frames() == 0u);
+    CHECK(cm.mouse().x() >= 0);
+    CHECK(!cm.dos().program_exited());
+    CHECK(cm.ems().free_pages() == 256u);
+    CHECK(cm.hd_pack().loaded_texture_count() == 0u);
+    CHECK(!cm.is_waiting_for_input());
+  }
+  {
+    static constexpr std::uint8_t kBiosCheck[] = {
+        0xCD, 0x11, 0xA3, 0x00, 0x00,        // int 11h -> [0]
+        0xCD, 0x12, 0xA3, 0x02, 0x00,        // int 12h -> [2]
+        0xB4, 0x00, 0xCD, 0x13,              // int 13h
+        0xB8, 0x00, 0x50, 0xCD, 0x15,        // int 15h (CF=1, AH=86h)
+        0xA3, 0x04, 0x00,
+        0xB4, 0x00, 0xCD, 0x1A,              // int 1Ah
+        0x89, 0x16, 0x06, 0x00,
+        0xEB, 0xFE,
+    };
+    m.load_synthetic_code(0x2500u, 0x0100u, kBiosCheck);
+    m.step_instructions(20u);
+    CHECK(m.guest_ram()[0x25000u] == 0x26u);
+    CHECK(m.guest_ram()[0x25002u] == (640u & 0xFFu));
+    CHECK(m.guest_ram()[0x25005u] == 0x86u);
+  }
+
+  // 2) INT 16h keyboard services (00h/10h, 01h/11h peek_key, 02h/12h, 03h, 05h).
+  m.dos().clear_keys();
+  bool kpoll = false;
+  emu->x86.R_IP = 0x0200u;
+  emu->x86.R_AH = 0x00u;
+  m.dos().handle_int16(emu, kpoll);
+  CHECK(kpoll && emu->x86.R_IP == 0x01FEu);
+
+  emu->x86.R_AH = 0x11u;
+  m.dos().handle_int16(emu, kpoll);
+  CHECK((emu->x86.R_FLG & FB_ZF) != 0u);
+
+  emu->x86.R_AH = 0x05u;
+  emu->x86.R_CL = 'K';
+  emu->x86.R_CH = 0x25u;
+  m.dos().handle_int16(emu, kpoll);
+
+  emu->x86.R_AH = 0x01u;
+  m.dos().handle_int16(emu, kpoll);
+  CHECK((emu->x86.R_FLG & FB_ZF) == 0u && emu->x86.R_AL == 'K');
+
+  emu->x86.R_AH = 0x10u;
+  m.dos().handle_int16(emu, kpoll);
+  CHECK(emu->x86.R_AL == 'K' && emu->x86.R_AH == 0x25u);
+
+  m.dos().set_shift_flags(0x05u);
+  emu->x86.R_AH = 0x12u;
+  m.dos().handle_int16(emu, kpoll);
+  CHECK(emu->x86.R_AL == 0x05u);
+  emu->x86.R_AH = 0x03u;
+  m.dos().handle_int16(emu, kpoll);
+
+  // 3) INT 21h console I/O (01h, 02h, 06h, 07h, 08h, 09h, 0Ah buffered line, 0Bh, 0Ch).
+  x86emu_set_seg_register(emu, emu->x86.R_DS_SEL, 0x2000u);
+  x86emu_set_seg_register(emu, emu->x86.R_ES_SEL, 0x2100u);
+  emu->x86.R_IP = 0x0300u;
+  emu->x86.R_AH = 0x01u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_IP == 0x02FEu);
+
+  m.dos().push_key('X', 0x2Du);
+  emu->x86.R_AH = 0x07u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == 'X');
+
+  emu->x86.R_AH = 0x02u;
+  emu->x86.R_DL = 'Z';
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == 'Z');
+
+  emu->x86.R_AH = 0x06u;
+  emu->x86.R_DL = 0xFFu;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_ZF) != 0u);
+  m.dos().push_key('Y', 0x15u);
+  emu->x86.R_AH = 0x06u;
+  emu->x86.R_DL = 0xFFu;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_ZF) == 0u && emu->x86.R_AL == 'Y');
+  emu->x86.R_AH = 0x06u;
+  emu->x86.R_DL = '!';
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == '!');
+
+  emu->x86.R_AH = 0x09u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == '$');
+
+  // AH=0Ah buffered input: "AB\bCD\r" with max_chars=5 (cap=4) -> "ACD\r" (len 3).
+  m.guest_ram()[0x20100u] = 5u;
+  for (char c : {'A', 'B', '\b', 'C', 'D', '\r'}) {
+    m.dos().push_key(static_cast<std::uint8_t>(c), 0x1Eu);
+  }
+  emu->x86.R_AH = 0x0Bu;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == 0xFFu);
+
+  emu->x86.R_AH = 0x0Au;
+  emu->x86.R_DX = 0x0100u;
+  m.dos().handle_int21(emu);
+  CHECK(m.guest_ram()[0x20101u] == 3u);
+  CHECK(std::memcmp(m.guest_ram() + 0x20102u, "ACD\r", 4u) == 0);
+
+  m.dos().push_key('Q', 0x10u);
+  emu->x86.R_AX = 0x0C06u;
+  emu->x86.R_DL = 0xFFu;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == 0x00u);  // flushed before reading!
+
+  // 4) INT 21h misc system, IOCTL, rename, truncate, MCB error paths, handle cap, & TSR.
+  emu->x86.R_AH = 0x0Du;
+  m.dos().handle_int21(emu);
+  emu->x86.R_AH = 0x0Eu;
+  emu->x86.R_DL = 2u;
+  m.dos().handle_int21(emu);
+  emu->x86.R_AH = 0x19u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == 2u);
+
+  emu->x86.R_AH = 0x1Au;
+  emu->x86.R_DX = 0x0400u;
+  m.dos().handle_int21(emu);
+  emu->x86.R_AH = 0x2Fu;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_ES == 0x2000u && emu->x86.R_BX == 0x0400u);
+
+  emu->x86.R_AX = 0x2565u;
+  emu->x86.R_DX = 0x1234u;
+  m.dos().handle_int21(emu);
+  emu->x86.R_AX = 0x3565u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_ES == 0x2000u && emu->x86.R_BX == 0x1234u);
+
+  x86emu_set_seg_register(emu, emu->x86.R_ES_SEL, 0x2100u);
+  emu->x86.R_AH = 0x2Au;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_CX == 1995u);
+  emu->x86.R_AH = 0x30u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == 5u);
+  emu->x86.R_AX = 0x3300u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_DL == 0u);
+  emu->x86.R_AH = 0x36u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AX == 64u);
+  emu->x86.R_AX = 0x3800u;
+  emu->x86.R_DX = 0x0500u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_BX == 1u);
+
+  std::memcpy(m.guest_ram() + 0x20600u, "ATTRTEST.DAT\0", 13u);
+  std::memcpy(m.guest_ram() + 0x20620u, "MISSING.DAT\0", 12u);
+  std::memcpy(m.guest_ram() + 0x20640u, "NUL\0", 4u);
+  std::memcpy(m.guest_ram() + 0x20660u, "REN_A.SAV\0", 10u);
+  std::memcpy(m.guest_ram() + 0x21680u, "REN_B.SAV\0", 10u);
+
+  emu->x86.R_AX = 0x4300u;
+  emu->x86.R_DX = 0x0600u;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_CX == 0x0020u);
+  emu->x86.R_AX = 0x4300u;
+  emu->x86.R_DX = 0x0620u;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_CF) != 0u);
+
+  // Open NUL device + IOCTL (44h AL=00h, 07h, 08h, invalid handle).
+  emu->x86.R_AX = 0x3D02u;
+  emu->x86.R_DX = 0x0640u;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_CF) == 0u);
+  const std::uint16_t nul_h = emu->x86.R_AX;
+
+  emu->x86.R_AX = 0x4400u;
+  emu->x86.R_BX = nul_h;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_DX == 0x0080u);
+  emu->x86.R_AX = 0x4400u;
+  emu->x86.R_BX = 999u;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_CF) != 0u && emu->x86.R_AX == 6u);
+  emu->x86.R_AX = 0x4407u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == 0xFFu);
+  emu->x86.R_AX = 0x4408u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AX == 1u);
+
+  // Create REN_A.SAV, write 10 bytes, truncate to 4 via AH=40h CX=0, close, and rename -> REN_B.SAV!
+  emu->x86.R_AX = 0x3C00u;
+  emu->x86.R_CX = 0u;
+  emu->x86.R_DX = 0x0660u;
+  m.dos().handle_int21(emu);
+  const std::uint16_t ren_h = emu->x86.R_AX;
+  std::memcpy(m.guest_ram() + 0x20700u, "0123456789", 10u);
+  emu->x86.R_AH = 0x40u;
+  emu->x86.R_BX = ren_h;
+  emu->x86.R_CX = 10u;
+  emu->x86.R_DX = 0x0700u;
+  m.dos().handle_int21(emu);
+  emu->x86.R_AX = 0x4200u;
+  emu->x86.R_BX = ren_h;
+  emu->x86.R_CX = 0u;
+  emu->x86.R_DX = 4u;
+  m.dos().handle_int21(emu);
+  emu->x86.R_AH = 0x40u;
+  emu->x86.R_BX = ren_h;
+  emu->x86.R_CX = 0u;  // truncate at pos 4!
+  m.dos().handle_int21(emu);
+  CHECK(std::filesystem::file_size(save_dir / "REN_A.SAV") == 4u);
+
+  emu->x86.R_AH = 0x56u;
+  emu->x86.R_DX = 0x0660u;
+  emu->x86.R_DI = 0x0680u;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_CF) == 0u);
+  CHECK(std::filesystem::exists(save_dir / "REN_B.SAV"));
+
+  // AH=47h, 49h/4Ah errors, 4Bh AL!=0, 50h/51h/62h, 57h, 58h UMB, 67h, INT 20h.
+  emu->x86.R_AH = 0x47u;
+  emu->x86.R_SI = 0x0750u;
+  m.dos().handle_int21(emu);
+  CHECK(m.guest_ram()[0x20750u] == 0u);
+
+  emu->x86.R_AX = 0x4B03u;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_CF) != 0u);
+
+  emu->x86.R_AX = 0x5803u;
+  emu->x86.R_BX = 1u;
+  m.dos().handle_int21(emu);
+  emu->x86.R_AX = 0x5802u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_AL == 1u);
+  emu->x86.R_AX = 0x5899u;
+  m.dos().handle_int21(emu);
+  CHECK((emu->x86.R_FLG & FB_CF) != 0u);
+
+  emu->x86.R_AH = 0x51u;
+  m.dos().handle_int21(emu);
+  const std::uint16_t orig_psp = emu->x86.R_BX;
+  emu->x86.R_AH = 0x50u;
+  emu->x86.R_BX = orig_psp;
+  m.dos().handle_int21(emu);
+  emu->x86.R_AX = 0x5700u;
+  m.dos().handle_int21(emu);
+  CHECK(emu->x86.R_DX == 0x2121u);
+  emu->x86.R_AH = 0x67u;
+  m.dos().handle_int21(emu);
+
+  // 5) VesaPlanarVideo VGA ports, INT 10h palette/VBE subfunctions, & PIT ch0 modes 1/2/3.
+  san4::VesaPlanarVideo& vid = m.video();
+  vid.reset_mode(0x0102u);
+  (void)vid.port_in8(0x03DAu);  // reset flip-flop
+  vid.port_out8(0x03C0u, 0x02u);
+  CHECK(vid.port_in8(0x03C0u) == 0x02u);
+  vid.port_out8(0x03C0u, 0x15u);
+  (void)vid.port_in8(0x03DAu);
+  vid.port_out8(0x03C0u, 0x02u);
+  CHECK(vid.port_in8(0x03C1u) == 0x15u);
+
+  vid.port_out8(0x03C4u, 0x02u);
+  vid.port_out8(0x03C5u, 0x0Fu);
+  CHECK(vid.port_in8(0x03C4u) == 0x02u && vid.port_in8(0x03C5u) == 0x0Fu);
+  vid.port_out8(0x03CEu, 0x05u);
+  vid.port_out8(0x03CFu, 0x00u);
+  CHECK(vid.port_in8(0x03CEu) == 0x05u && vid.port_in8(0x03CFu) == 0x00u);
+  vid.port_out8(0x03C6u, 0xFFu);
+  CHECK(vid.port_in8(0x03C6u) == 0xFFu);
+
+  vid.port_out8(0x03C8u, 0x05u);
+  CHECK(vid.port_in8(0x03C8u) == 0x05u);
+  vid.port_out8(0x03C9u, 0x11u);
+  vid.port_out8(0x03C9u, 0x22u);
+  vid.port_out8(0x03C9u, 0x33u);
+  vid.port_out8(0x03C7u, 0x05u);
+  CHECK(vid.port_in8(0x03C9u) == 0x11u && vid.port_in8(0x03C9u) == 0x22u &&
+        vid.port_in8(0x03C9u) == 0x33u);
+  for (int i = 0; i < 5; ++i) {
+    (void)vid.port_in8(0x03BAu);
+  }
+  CHECK(vid.consume_vsync_edge());
+  CHECK(!vid.consume_vsync_edge());
+
+  // INT 10h subfunctions: 4F03h, 1130h, 0Fh, 10h AL=00,01,02,07,08,09,10,12,15,17
+  const std::span<std::uint8_t> ram_span(m.guest_ram(),
+                                         san4::X86Machine::kGuestRamBytes);
+  std::uint16_t ax = 0x4F03u, bx = 0u, cx = 0u, dx = 0u, es = 0x2100u, bp = 0u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  CHECK(ax == 0x004Fu && bx == 0x0102u);
+
+  ax = 0x1130u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  CHECK(es == 0xF000u && bp == 0xB000u && cx == 16u);
+
+  es = 0x2100u;
+  ax = 0x0F00u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  CHECK((ax >> 8) == 80u);
+
+  ax = 0x1000u;
+  bx = 0x2A03u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  ax = 0x1007u;
+  bx = 0x0003u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  CHECK((bx >> 8) == 0x2Au);
+
+  ax = 0x1001u;
+  bx = 0x1700u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  ax = 0x1008u;
+  bx = 0u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  CHECK((bx >> 8) == 0x17u);
+
+  ax = 0x1009u;
+  dx = 0x0000u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  ax = 0x1002u;
+  dx = 0x0000u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+
+  ax = 0x1010u;
+  bx = 4u;
+  dx = 0x1500u;
+  cx = 0x2535u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  ax = 0x1015u;
+  bx = 4u;
+  cx = 0u;
+  dx = 0u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  CHECK((dx >> 8) == 0x15u && cx == 0x2535u);
+
+  ax = 0x1017u;
+  bx = 0u;
+  cx = 4u;
+  dx = 0x0100u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  ax = 0x1012u;
+  bx = 0u;
+  cx = 4u;
+  dx = 0x0100u;
+  vid.handle_int10(ax, bx, cx, dx, es, bp, 0u, ram_span, 0xF000u, 0xB000u,
+                   0x0500u, 0x0510u, emu);
+  vid.clear_all_glyphs();
+
+  // 6) HdPackManager::on_npk_blit_complete (clipped dynamic CG + cache_hits) &
+  //    utility helpers (parse_mode, ascii_lower, HostStatus::operator==, win32_platform).
+  {
+    const auto npk_full =
+        build_synthetic_npk_image(false, true, 8, 4, 0x1122u, 0x3344u);
+    const std::span<const std::uint8_t> npk_stream(npk_full.data() + 48u,
+                                                   npk_full.size() - 48u);
+    std::vector<std::uint8_t> npk_slots;
+    CHECK(san4::codecs::decompress_npk_bitstream(npk_stream, 8, 4, npk_slots));
+    const std::uint64_t npk_hash =
+        san4::HdPackManager::hash_sprite_4bit(8, 4, npk_slots.data());
+    const std::vector<std::uint32_t> cg_px(32u * 16u, 0xFF446688u);
+    CHECK(san4::HdPackManager::save_argb_png(hd_dir / "cg" / "test_npk.png", 32,
+                                             16, cg_px.data()));
+    {
+      std::ofstream mf(hd_dir / "hd_manifest.tsv", std::ios::binary);
+      char hbuf[32];
+      std::snprintf(hbuf, sizeof(hbuf), "%016llx",
+                    static_cast<unsigned long long>(npk_hash));
+      mf << hbuf
+         << "\t8\t4\t3\tcg/test_npk.png\t"
+            "000000,111111,222222,333333,444444,555555,666666,777777,"
+            "888888,999999,aaaaaa,bbbbbb,cccccc,dddddd,eeeeee,ffffff\n";
+    }
+    san4::HdPackManager hd;
+    hd.set_pack_dir(hd_dir);
+    vid.latch_frame();
+    // Clipped NPK blit hits decompress_npk_bitstream + register_dynamic_cg;
+    // second call hits texture LRU cache (cache_hits() > 0)!
+    hd.on_npk_blit_complete(0, 0, 8, 4, san4::GrpClipRect{0, 0, 5, 3},
+                            npk_stream, vid);
+    hd.on_npk_blit_complete(16, 0, 8, 4, san4::GrpClipRect{16, 0, 21, 3},
+                            npk_stream, vid);
+    CHECK(hd.cache_hits() >= 1u);
+  }
+
+  {
+    san4::UpscaleMode pm = san4::UpscaleMode::Nearest;
+    CHECK(san4::PixelUpscaler::parse_mode("nearest", pm) &&
+          pm == san4::UpscaleMode::Nearest);
+    CHECK(san4::PixelUpscaler::parse_mode("1x", pm) &&
+          pm == san4::UpscaleMode::Nearest);
+    CHECK(san4::PixelUpscaler::parse_mode("sharp2x", pm) &&
+          pm == san4::UpscaleMode::Sharp2x);
+    CHECK(san4::PixelUpscaler::parse_mode("scale2x", pm) &&
+          pm == san4::UpscaleMode::Scale2x);
+    CHECK(san4::PixelUpscaler::parse_mode("xbr2x", pm) &&
+          pm == san4::UpscaleMode::Xbr2x);
+    CHECK(san4::PixelUpscaler::parse_mode("xbr4x", pm) &&
+          pm == san4::UpscaleMode::Xbr4x);
+    CHECK(!san4::PixelUpscaler::parse_mode("invalid", pm));
+
+    CHECK(san4::util::ascii_lower("AbC_123-XyZ") == "abc_123-xyz");
+    san4::HostStatus hs1{}, hs2{};
+    CHECK(hs1 == hs2);
+    hs2.speed_multiplier = 4;
+    CHECK(!(hs1 == hs2));
+
+    ScopedEnvVar no_dlg("SAN4_NO_ERROR_DIALOG", "1");
+    san4::win32_platform::init_process();
+    san4::win32_platform::attach_parent_console_if_needed();
+    san4::win32_platform::show_error_dialog("Test", "Suppressed");
+    char arg0[] = "san4-test";
+    char arg1[] = "--help";
+    char* argv_test[] = {arg0, arg1, nullptr};
+    const auto uargs = san4::win32_platform::get_utf8_args(2, argv_test);
+    CHECK(!uargs.empty());
+    CHECK(!san4::win32_platform::get_executable_path("san4-test").empty());
+    CHECK(!san4::win32_platform::get_env_path("").has_value());
+  }
+
+  // INT 20h terminate on a booted stub .COM
+  {
+    static constexpr std::uint8_t kInt20Com[] = {0xCD, 0x20};
+    write_binary_file_checked(game_dir / "EXIT20.COM", kInt20Com);
+    CHECK(m.boot("EXIT20.COM"));
+    m.step_instructions(4u);
+    CHECK(m.exited());
+  }
+}
+
+void test_machine_grp600c_hle_intercepts_pit_ch0_and_sync_loop() {
+  ScopedTempDir tmp;
+  const auto game_dir = tmp.path() / "game";
+  const auto save_dir = tmp.path() / "save";
+  const auto hd_dir = tmp.path() / "hd";
+  const auto dump_dir = tmp.path() / "dump";
+  std::filesystem::create_directories(game_dir);
+  std::filesystem::create_directories(save_dir);
+  std::filesystem::create_directories(hd_dir);
+  std::filesystem::create_directories(dump_dir);
+
+  san4::MachineConfig cfg;
+  cfg.game_dir = game_dir;
+  cfg.save_dir = save_dir;
+  cfg.dump_sprites_dir = dump_dir;
+  san4::X86Machine m(cfg);
+  m.video().reset_mode(0x0102u);
+
+  // 1) Speed multiplier cycle (1 -> 2 -> 4 -> 1) and invalid clamping.
+  CHECK(m.cycle_base_speed_multiplier() == 2);
+  CHECK(m.cycle_base_speed_multiplier() == 4);
+  CHECK(m.cycle_base_speed_multiplier() == 1);
+  m.set_base_speed_multiplier(99);
+  CHECK(m.base_speed_multiplier() == 4);
+  m.set_base_speed_multiplier(0);
+  CHECK(m.base_speed_multiplier() == 1);
+
+  // 2) Fallback INT F1h without GRP600C loaded (`grp600c_cs() == 0`):
+  //    16x16 mono blit marks glyph tile; 32x16 planar multi-pass queues LegacyMultiPlane.
+  {
+    std::vector<std::uint8_t> no_grp_code = {
+        0xB8, 0x00, 0x13,  // mov ax, 0x1300
+        0xBB, 0x10, 0x00,  // mov bx, 16
+        0xB9, 0x10, 0x00,  // mov cx, 16
+        0xBE, 0x10, 0x00,  // mov si, 16
+        0xBF, 0x10, 0x00,  // mov di, 16
+        0xCD, 0xF1,        // int 0xF1 (marks 16x16 glyph)
+        0xB8, 0x00, 0x0F,  // mov ax, 0x0F00
+        0xBB, 0x40, 0x00,  // mov bx, 64
+        0xB9, 0x40, 0x00,  // mov cx, 64
+        0xBE, 0x20, 0x00,  // mov si, 32
+        0xBF, 0x10, 0x00,  // mov di, 16
+        0xCD, 0xF1,        // int 0xF1 (pass 1)
+        0xCD, 0xF1,        // int 0xF1 (pass 2)
+        0xB8, 0x00, 0x14,  // mov ax, 0x1400 (flushes LegacyMultiPlane)
+        0xCD, 0xF1,
+        0xEB, 0xFE,        // jmp $
+    };
+    m.load_synthetic_code(0x3000u, 0x0000u, no_grp_code, 0x3000u, 0x0FF0u);
+    m.step_instructions(64u);
+    CHECK(m.video().live_glyph_tiles()[san4::VesaPlanarVideo::kTilesX + 1u] != 0u);
+  }
+
+  // 3) PIT channel 0 access modes (LSB=1, MSB=2, LSB+MSB=3, latch=0) + port_in8
+  //    routing for VGA (0x3DA), OPL2 (0x388), PIC (0x21), KBD (0x60), PC-98 (0x5F).
+  {
+    std::vector<std::uint8_t> io_code = {
+        // Mode 1 (LSB only): out 0x43, 0x16; out 0x40, 0x80; in al, 0x40
+        0xB0, 0x16, 0xE6, 0x43,
+        0xB0, 0x80, 0xE6, 0x40,
+        0xE4, 0x40,
+        // Latch in mode 1: out 0x43, 0x00; in al, 0x40
+        0xB0, 0x00, 0xE6, 0x43,
+        0xE4, 0x40,
+        // Mode 2 (MSB only): out 0x43, 0x26; out 0x40, 0x10; in al, 0x40
+        0xB0, 0x26, 0xE6, 0x43,
+        0xB0, 0x10, 0xE6, 0x40,
+        0xE4, 0x40,
+        // Latch in mode 2: out 0x43, 0x00; in al, 0x40
+        0xB0, 0x00, 0xE6, 0x43,
+        0xE4, 0x40,
+        // Mode 3 (LSB+MSB): out 0x43, 0x36; out 0x40, 0x00; out 0x40, 0x20
+        0xB0, 0x36, 0xE6, 0x43,
+        0xB0, 0x00, 0xE6, 0x40,
+        0xB0, 0x20, 0xE6, 0x40,
+        // Unlatched 2-byte read, then latched 2-byte read:
+        0xE4, 0x40, 0xE4, 0x40,
+        0xB0, 0x00, 0xE6, 0x43,
+        0xE4, 0x40, 0xE4, 0x40,
+        // VGA 0x3DA, OPL2 0x388, PIC 0x21, KBD 0x60, PC-98 stub 0x5F:
+        0xBA, 0xDA, 0x03, 0xEC,
+        0xBA, 0x88, 0x03, 0xEC,
+        0xE4, 0x21,
+        0xE4, 0x60,
+        0xE4, 0x5F,
+        0xEB, 0xFE,
+    };
+    m.load_synthetic_code(0x3100u, 0x0000u, io_code, 0x3100u, 0x0FF0u);
+    m.step_instructions(128u);
+    CHECK(m.emu()->x86.R_AL == 0xFFu);
+  }
+
+  // 4) Install fake GRP600C TSR and exercise all HLE dispatch & flush hooks:
+  //    AH=0x0F (PlanarBlit0F -> dumps 16x16 sprite -> reload as 4x HD texture!),
+  //    AH=0x10 (ReadPlanar), AH=0x13 (MonoBlit13 16x16 & 32x16),
+  //    AH=0x17 (CopyRect17), AH=0x18 (SwapRect18),
+  //    AH=0x19 (BlitNpk19 unclipped & clipped), AH=0x16 (SmoothFade + FadeHold),
+  //    and AH=0x00 (Init + finish fade).
+  const std::uint16_t grp_cs = boot_fake_grp600c(game_dir, m);
+  CHECK(grp_cs != 0u);
+  m.set_grp_census_enabled(true);
+  const std::uint32_t grp_lin = static_cast<std::uint32_t>(grp_cs) << 4;
+  // Set active planes = 4, clip = (0, 0, 799, 599), slot_map = kGrpSlotMap.
+  m.guest_ram()[grp_lin + san4::kGrpCsActivePlanesOffset] = 4u;
+  m.guest_ram()[grp_lin + san4::kGrpCsClipX1Offset + 0u] = 0x1Fu;
+  m.guest_ram()[grp_lin + san4::kGrpCsClipX1Offset + 1u] = 0x03u;
+  m.guest_ram()[grp_lin + san4::kGrpCsClipY1Offset + 0u] = 0x57u;
+  m.guest_ram()[grp_lin + san4::kGrpCsClipY1Offset + 1u] = 0x02u;
+  std::memcpy(m.guest_ram() + grp_lin + san4::kGrpSlotMapOff,
+              san4::kGrpSlotMap.data(), san4::kGrpSlotMap.size());
+
+  // Populate non-zero 4-plane 16x16 source bitmap at 0x4000:0x0000 (128 bytes).
+  for (std::size_t i = 0; i < 128u; ++i) {
+    m.guest_ram()[0x40000u + i] = static_cast<std::uint8_t>((i * 29u + 7u) | 1u);
+  }
+  // Populate target fade RGB4 table at 0x4000:0x0200 (12 bytes for 4 colors).
+  for (std::size_t i = 0; i < 12u; ++i) {
+    m.guest_ram()[0x40200u + i] = static_cast<std::uint8_t>(15u - (i & 7u));
+  }
+
+  const auto lo = static_cast<std::uint8_t>(grp_cs & 0xFFu);
+  const auto hi = static_cast<std::uint8_t>(grp_cs >> 8);
+  auto emit_grp_call = [&](std::vector<std::uint8_t>& c, std::uint16_t ax,
+                           std::uint16_t bx, std::uint16_t cx, std::uint16_t dx,
+                           std::uint16_t si, std::uint16_t di, std::uint16_t bp) {
+    auto mov16 = [&](std::uint8_t op, std::uint16_t v) {
+      c.push_back(op);
+      c.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+      c.push_back(static_cast<std::uint8_t>(v >> 8));
+    };
+    mov16(0xB8, 0x4000u);
+    c.push_back(0x8E);
+    c.push_back(0xC0);  // mov es, ax
+    mov16(0xB8, ax);
+    mov16(0xBB, bx);
+    mov16(0xB9, cx);
+    mov16(0xBA, dx);
+    mov16(0xBE, si);
+    mov16(0xBF, di);
+    mov16(0xBD, bp);
+    c.insert(c.end(), {0x9A, 0x18, 0x00, lo, hi});  // lcall grp_cs:0x0018
+  };
+
+  // First pass: dump the 16x16 sprite via AH=0x0F, then promote it into hd_dir
+  // as a 64x64 4x RGBA override so loaded_texture_count() == 1 and AH=0x0F
+  // places an active HD region!
+  {
+    std::vector<std::uint8_t> dump_prog;
+    emit_grp_call(dump_prog, 0x0F00u, 32u, 32u, 0u, 16u, 16u, 0x0000u);
+    dump_prog.insert(dump_prog.end(), {0xEB, 0xFE});
+    m.load_synthetic_code(0x3200u, 0x0000u, dump_prog, 0x3200u, 0x0FF0u);
+    m.step_instructions(64u);
+  }
+  std::filesystem::path dumped_png;
+  for (const auto& ent : std::filesystem::directory_iterator(dump_dir)) {
+    if (ent.path().extension() == ".png") {
+      dumped_png = ent.path();
+      break;
+    }
+  }
+  CHECK(!dumped_png.empty());
+  std::filesystem::copy_file(
+      dumped_png, hd_dir / dumped_png.filename(),
+      std::filesystem::copy_options::overwrite_existing);
+  m.hd_pack().set_pack_dir(hd_dir);
+  CHECK(m.hd_pack().loaded_texture_count() == 1u);
+
+  // Second pass: full GRP600C HLE pipeline with active HD pack!
+  {
+    std::vector<std::uint8_t> grp_prog;
+    // AH=0x0F PlanarBlit 16x16 at (32, 32) -> active_overlay_count() > 0!
+    emit_grp_call(grp_prog, 0x0F00u, 32u, 32u, 0u, 16u, 16u, 0x0000u);
+    // AH=0x10 ReadPlanar 16x16 at (32, 32) (flushes PlanarBlit0F first!)
+    emit_grp_call(grp_prog, 0x1000u, 32u, 32u, 0u, 16u, 16u, 0x0000u);
+    // AH=0x13 MonoBlit 16x16 glyph at (48, 32) & 32x16 UI pattern at (80, 32)
+    emit_grp_call(grp_prog, 0x1300u, 48u, 32u, 0u, 16u, 16u, 0x0000u);
+    emit_grp_call(grp_prog, 0x1300u, 80u, 32u, 0u, 32u, 16u, 0x0000u);
+    // AH=0x17 CopyRect 16x16 from (32, 32) to (64, 32) (w=DX=16, h=SI=16, dst=DI,BP)
+    emit_grp_call(grp_prog, 0x1700u, 32u, 32u, 16u, 16u, 64u, 32u);
+    // AH=0x18 SwapPlanarRect 16x16 at (32, 32) (w=DX=16, h=SI=16, ES:DI=0x4000:0x0300)
+    emit_grp_call(grp_prog, 0x1800u, 32u, 32u, 16u, 16u, 0x0300u, 0u);
+    // AH=0x19 BlitNpk unclipped at (128, 32) & clipped at (-4, 32)
+    emit_grp_call(grp_prog, 0x1900u, 128u, 32u, 16u, 16u, 0x0000u, 0u);
+    emit_grp_call(grp_prog, 0x1900u, static_cast<std::uint16_t>(-4), 32u, 16u,
+                  16u, 0x0000u, 0u);
+    // AH=0x16 SmoothFade (start=0, count=4, steps=2, vsyncs=2, ES:BX=0x4000:0x0200)
+    emit_grp_call(grp_prog, 0x1600u, 0x0200u, 0x0204u, 2u, 0u, 0u, 0u);
+    // Resumes here once fade completes: AH=0x14 SetPaletteSingle & AH=0x00 Init!
+    emit_grp_call(grp_prog, 0x1400u, 0u, 0u, 0u, 0u, 0u, 0u);
+    emit_grp_call(grp_prog, 0x0000u, 0u, 0u, 0u, 0u, 0u, 0u);
+    grp_prog.insert(grp_prog.end(), {0xEB, 0xFE});
+
+    m.load_synthetic_code(0x3300u, 0x0000u, grp_prog, 0x3300u, 0x0FF0u);
+    m.run_frame(1.0 / 60.0, 0.005);
+    CHECK(m.video().is_fading());
+    for (int f = 0; f < 10 && m.video().is_fading(); ++f) {
+      m.run_frame(0.025, 0.005);
+    }
+    m.run_frame(0.025, 0.005);
+    CHECK(!m.video().is_fading());
+    CHECK(m.grp_census() != nullptr);
+    std::ostringstream census_ss;
+    m.grp_census()->print(census_ss);
+    CHECK(census_ss.str().find("GRP600C") != std::string::npos);
+    m.set_grp_census_enabled(false);
+    CHECK(m.grp_census() == nullptr);
+  }
+
+  // 5) Synchronous EmuSession::run_loop (3-argument overload) + SdlHost cursor callback.
+  {
+    ScopedTempDir host_tmp;
+    const auto gdir = host_tmp.path() / "game";
+    std::filesystem::create_directories(gdir);
+    // `mov ax, 1; int 0x33; mov ax, 0x4C00; int 0x21` -> triggers cursor callback & exits!
+    static constexpr std::uint8_t kCursorExitCom[] = {
+        0xB8, 0x01, 0x00, 0xCD, 0x33, 0xB8, 0x00, 0x4C, 0xCD, 0x21};
+    write_binary_file_checked(gdir / "SAN486.COM", kCursorExitCom);
+
+    san4::MachineConfig sync_cfg;
+    sync_cfg.game_dir = gdir;
+    sync_cfg.save_dir = gdir;
+    san4::X86Machine sync_m(sync_cfg);
+    CHECK(sync_m.boot("SAN486.COM"));
+    san4::PixelUpscaler sync_up;
+    san4::EmuSession sync_session(sync_m, sync_up);
+    san4::FrameMailbox sync_mb;
+    san4::HostCommandQueue sync_cmds;
+    san4::EmuSession::LoopOptions loop_opts;
+    loop_opts.drain_audio = true;
+    loop_opts.profiling = true;
+    sync_session.run_loop(sync_mb, sync_cmds, loop_opts);
+    CHECK(sync_m.exited());
+
+    ScopedEnvVar dummy_vid("SDL_VIDEODRIVER", "dummy");
+    ScopedEnvVar dummy_aud("SDL_AUDIODRIVER", "dummy");
+    san4::HostOptions hopts;
+    hopts.game_dir = gdir;
+    hopts.save_dir = gdir;
+    san4::SdlHost host(hopts);
+    CHECK(host.run() == 0);
+  }
+}
+
+}  // namespace
+
 int main() {
   using SuiteFn = void (*)();
   static constexpr SuiteFn kSuites[] = {
@@ -7451,9 +9760,18 @@ int main() {
       test_vfs_cow_readonly_saves_and_device_rejection,
       test_frame_mailbox_current_acquired_and_host_helpers,
       test_machine_rom_protection_noperm_vram_and_ubsan_shifts,
+      test_runtime_cli_parsing_discovery_and_execution,
+      test_hdpack_generator_cli_and_synthetic_pipeline,
+      test_sdl_host_headless_script_and_profiler_end_to_end,
+      test_sdl_host_interactive_events_audio_and_present_slot,
+      test_audio_pit_ch2_speaker_opl3_and_underrun_decay,
+      test_ems_4_0_complete_subfunctions_and_error_codes,
+      test_mouse_hle_complete_int33_contract,
+      test_dos_kernel_console_ioctl_tsr_and_video_bios_ports,
+      test_machine_grp600c_hle_intercepts_pit_ch0_and_sync_loop,
   };
-  static_assert(sizeof(kSuites) / sizeof(kSuites[0]) == 61u);
-  // Invoke through a volatile pointer so LTO/ASan cannot inline all 61 suites'
+  static_assert(sizeof(kSuites) / sizeof(kSuites[0]) == 70u);
+  // Invoke through a volatile pointer so LTO/ASan cannot inline all 70 suites'
   // X86Machine / VesaPlanarVideo stack frames into a single giant main() frame.
   for (SuiteFn suite : kSuites) {
     SuiteFn volatile run = suite;
@@ -7464,6 +9782,6 @@ int main() {
     std::cerr << "[san4_tests] FAILED (" << g_failures << " error(s))\n";
     return 1;
   }
-  std::cout << "[san4_tests] ALL 61 CONFORMANCE & BENCHMARK SUITES PASSED\n";
+  std::cout << "[san4_tests] ALL 70 CONFORMANCE & BENCHMARK SUITES PASSED\n";
   return 0;
 }

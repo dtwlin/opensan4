@@ -74,7 +74,7 @@ ctest --test-dir build --output-on-failure
 
 ### 公開 CI／純引擎建置（無須遊戲檔案）
 
-專案貢獻者與 CI 執行環境無須擁有原版遊戲檔案，即可在開啟嚴格編譯警告（`-Wall -Wextra -Wpedantic -Werror`）下編譯 `san4-linux`、`san4-hdpack-gen` 與 `san4_tests`，並在 ASan + UBSan 與 ThreadSanitizer（TSan）下執行全部 `61` 組合成相容性、編解碼器、放大演算法、硬體模擬、並行處理、LTO／SIMD、安全性與二進位整潔度測試套件：
+專案貢獻者與 CI 執行環境無須擁有原版遊戲檔案，即可在開啟嚴格編譯警告（`-Wall -Wextra -Wpedantic -Werror`）下編譯 `san4-linux`、`san4-hdpack-gen` 與 `san4_tests`，並在 ASan + UBSan、ThreadSanitizer（TSan）以及 Clang `llvm-cov` 原始碼級別程式碼覆蓋率檢測下執行全部 `70` 組合成相容性、編解碼器、放大演算法、硬體模擬、並行處理、CLI／宿主環境、LTO／SIMD、安全性與二進位整潔度測試套件：
 
 ```bash
 # AddressSanitizer + UndefinedBehaviorSanitizer
@@ -86,6 +86,9 @@ ctest --test-dir build-asan --output-on-failure
 cmake -S . -B build-tsan -DSAN4_CI_NO_GAME=ON -DSAN4_ENABLE_TSAN=ON -DSAN4_WARNINGS_AS_ERRORS=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-tsan -j
 ctest --test-dir build-tsan --output-on-failure
+
+# Clang 原始碼級別程式碼覆蓋率報告（llvm-cov）
+./scripts/run_coverage.sh --min-line-pct 90
 ```
 
 ### CMake 建置選項
@@ -101,6 +104,7 @@ ctest --test-dir build-tsan --output-on-failure
 - `-DSAN4_WARNINGS_AS_ERRORS=ON`：將所有編譯器警告視為錯誤（`-Werror`）。
 - `-DSAN4_ENABLE_SANITIZERS=ON`：為建置目標加入 AddressSanitizer 與 UndefinedBehaviorSanitizer 檢測（與 `SAN4_ENABLE_TSAN` 互斥）。
 - `-DSAN4_ENABLE_TSAN=ON`：為建置目標加入 ThreadSanitizer 執行緒競爭檢測（與 `SAN4_ENABLE_SANITIZERS` 互斥）。
+- `-DSAN4_ENABLE_COVERAGE=ON`：為建置目標加入 Clang 原始碼級別程式碼覆蓋率檢測（`-fprofile-instr-generate -fcoverage-mapping`；需要 Clang，且與各類 Sanitizer、PGO 及 `SAN4_STATIC` 選項互斥）。
 - `-DSAN4_STATIC=ON`：可攜式靜態建置模式，從 `SAN4_STATIC_PREFIX` 將 SDL2、libx86emu、libpng、zlib、`libstdc++` 與 `libgcc` 靜態連結至執行檔中（預設為 `OFF`；與各類 Sanitizer 選項不相容）。詳見[可攜式靜態建置](#可攜式靜態建置)。
 - `-DSAN4_STATIC_PREFIX=<DIR>`：由 `scripts/build_static_deps.sh` 建立之靜態相依套件前綴目錄（預設為 `third_party/static`；若執行 `./scripts/build_static.sh --clang-lto` 則為 `third_party/static-clang-lto`）。若該目錄缺少任何標頭檔或靜態封存檔，設定階段會列出缺少的檔案並立即中止。
 

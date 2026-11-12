@@ -122,6 +122,30 @@ if (( has_clang )); then
   fi
   assert_contains "${out}" "cannot be combined with SAN4_ENABLE_SANITIZERS or SAN4_ENABLE_TSAN" \
     "PGO + TSan mutual exclusion"
+
+  # 8b. SAN4_ENABLE_COVERAGE=ON configures cleanly on Clang (defaulting LTO=OFF)
+  #     and rejects sanitizers and PGO.
+  out="$("${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${WORK_DIR}/clang_cov_ok" \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSAN4_CI_NO_GAME=ON -DSAN4_USE_CLANG=ON \
+    -DSAN4_ENABLE_COVERAGE=ON 2>&1)" ||
+    fail "Clang SAN4_ENABLE_COVERAGE=ON configure failed: ${out}"
+  assert_contains "${out}" "LTO=OFF" "Clang coverage defaults LTO=OFF"
+
+  if out="$("${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${WORK_DIR}/clang_cov_asan_bad" \
+      -DSAN4_CI_NO_GAME=ON -DSAN4_USE_CLANG=ON \
+      -DSAN4_ENABLE_COVERAGE=ON -DSAN4_ENABLE_SANITIZERS=ON 2>&1)"; then
+    fail "SAN4_ENABLE_COVERAGE=ON + SAN4_ENABLE_SANITIZERS=ON unexpectedly succeeded"
+  fi
+  assert_contains "${out}" "SAN4_ENABLE_COVERAGE cannot be combined" \
+    "coverage + ASan mutual exclusion"
+
+  if out="$("${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${WORK_DIR}/clang_cov_pgo_bad" \
+      -DSAN4_CI_NO_GAME=ON -DSAN4_USE_CLANG=ON \
+      -DSAN4_ENABLE_COVERAGE=ON -DSAN4_PGO_MODE=GENERATE 2>&1)"; then
+    fail "SAN4_ENABLE_COVERAGE=ON + SAN4_PGO_MODE=GENERATE unexpectedly succeeded"
+  fi
+  assert_contains "${out}" "SAN4_ENABLE_COVERAGE cannot be combined with SAN4_PGO_MODE" \
+    "coverage + PGO mutual exclusion"
 fi
 
 # 9. Invalid SAN4_PGO_MODE must fail at configure time on any compiler.
@@ -141,6 +165,15 @@ if command -v gcc >/dev/null 2>&1 && command -v g++ >/dev/null 2>&1; then
     fail "GCC + SAN4_PGO_MODE=GENERATE unexpectedly succeeded"
   fi
   assert_contains "${out}" "requires Clang" "non-Clang PGO rejection"
+
+  if out="$("${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${WORK_DIR}/gcc_cov_bad" \
+      -DSAN4_CI_NO_GAME=ON -DSAN4_USE_CLANG=OFF \
+      -DCMAKE_C_COMPILER="$(command -v gcc)" \
+      -DCMAKE_CXX_COMPILER="$(command -v g++)" \
+      -DSAN4_ENABLE_COVERAGE=ON 2>&1)"; then
+    fail "GCC + SAN4_ENABLE_COVERAGE=ON unexpectedly succeeded"
+  fi
+  assert_contains "${out}" "SAN4_ENABLE_COVERAGE requires Clang" "non-Clang coverage rejection"
 fi
 
 # 11. SAN4_STATIC=ON + missing SAN4_PGO_X86EMU_LIB override must fail fast.

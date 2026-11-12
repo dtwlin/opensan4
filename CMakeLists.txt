@@ -58,6 +58,7 @@ option(SAN4_ENABLE_AVX2 "Enable AVX2 instructions on x86_64" OFF)
 option(SAN4_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(SAN4_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(SAN4_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(SAN4_ENABLE_COVERAGE "Enable Clang source-based code coverage (-fprofile-instr-generate -fcoverage-mapping)" OFF)
 option(SAN4_STATIC "Link SDL2, libx86emu, libpng, zlib and the C++ runtime statically (portable binary)" OFF)
 set(SAN4_STATIC_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/third_party/static" CACHE PATH
   "Install prefix populated by scripts/build_static_deps.sh for SAN4_STATIC builds")
@@ -69,8 +70,23 @@ endif()
 if(SAN4_STATIC AND (SAN4_ENABLE_SANITIZERS OR SAN4_ENABLE_TSAN))
   message(FATAL_ERROR "SAN4_STATIC cannot be combined with sanitizer builds (the sanitizer runtimes require a dynamic C++ runtime).")
 endif()
+if(SAN4_ENABLE_COVERAGE)
+  if(SAN4_ENABLE_SANITIZERS OR SAN4_ENABLE_TSAN OR SAN4_STATIC)
+    message(FATAL_ERROR
+      "SAN4_ENABLE_COVERAGE cannot be combined with SAN4_ENABLE_SANITIZERS, "
+      "SAN4_ENABLE_TSAN, or SAN4_STATIC.")
+  endif()
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR
+      "SAN4_ENABLE_COVERAGE requires Clang (-DSAN4_USE_CLANG=ON), but the "
+      "configured compiler is ${CMAKE_CXX_COMPILER_ID}.")
+  endif()
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/clang_lto.cmake")
+if(SAN4_ENABLE_COVERAGE AND NOT _san4_pgo_mode_upper STREQUAL "OFF")
+  message(FATAL_ERROR "SAN4_ENABLE_COVERAGE cannot be combined with SAN4_PGO_MODE=${SAN4_PGO_MODE}.")
+endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_game_dir.cmake")
 
 find_package(Threads REQUIRED)
@@ -153,29 +169,32 @@ else()
   endif()
 endif()
 
-file(REAL_PATH "${CMAKE_CURRENT_SOURCE_DIR}" _SAN4_REAL_SOURCE_DIR)
-file(REAL_PATH "${CMAKE_BINARY_DIR}" _SAN4_REAL_BINARY_DIR)
-set(SAN4_PREFIX_MAP_FLAGS
-  "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=."
-  "-ffile-prefix-map=${_SAN4_REAL_SOURCE_DIR}=."
-  "-ffile-prefix-map=${CMAKE_BINARY_DIR}=."
-  "-ffile-prefix-map=${_SAN4_REAL_BINARY_DIR}=."
-)
-if(SAN4_STATIC AND SAN4_STATIC_PREFIX)
-  list(APPEND SAN4_PREFIX_MAP_FLAGS "-ffile-prefix-map=${SAN4_STATIC_PREFIX}=.")
-  if(EXISTS "${SAN4_STATIC_PREFIX}")
-    file(REAL_PATH "${SAN4_STATIC_PREFIX}" _SAN4_REAL_STATIC_PREFIX)
-    list(APPEND SAN4_PREFIX_MAP_FLAGS "-ffile-prefix-map=${_SAN4_REAL_STATIC_PREFIX}=.")
+set(SAN4_PREFIX_MAP_FLAGS "")
+if(NOT SAN4_ENABLE_COVERAGE)
+  file(REAL_PATH "${CMAKE_CURRENT_SOURCE_DIR}" _SAN4_REAL_SOURCE_DIR)
+  file(REAL_PATH "${CMAKE_BINARY_DIR}" _SAN4_REAL_BINARY_DIR)
+  set(SAN4_PREFIX_MAP_FLAGS
+    "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=."
+    "-ffile-prefix-map=${_SAN4_REAL_SOURCE_DIR}=."
+    "-ffile-prefix-map=${CMAKE_BINARY_DIR}=."
+    "-ffile-prefix-map=${_SAN4_REAL_BINARY_DIR}=."
+  )
+  if(SAN4_STATIC AND SAN4_STATIC_PREFIX)
+    list(APPEND SAN4_PREFIX_MAP_FLAGS "-ffile-prefix-map=${SAN4_STATIC_PREFIX}=.")
+    if(EXISTS "${SAN4_STATIC_PREFIX}")
+      file(REAL_PATH "${SAN4_STATIC_PREFIX}" _SAN4_REAL_STATIC_PREFIX)
+      list(APPEND SAN4_PREFIX_MAP_FLAGS "-ffile-prefix-map=${_SAN4_REAL_STATIC_PREFIX}=.")
+    endif()
   endif()
-endif()
-if(CMAKE_SYSROOT)
-  list(APPEND SAN4_PREFIX_MAP_FLAGS "-ffile-prefix-map=${CMAKE_SYSROOT}=.")
-  if(EXISTS "${CMAKE_SYSROOT}")
-    file(REAL_PATH "${CMAKE_SYSROOT}" _SAN4_REAL_SYSROOT)
-    list(APPEND SAN4_PREFIX_MAP_FLAGS "-ffile-prefix-map=${_SAN4_REAL_SYSROOT}=.")
+  if(CMAKE_SYSROOT)
+    list(APPEND SAN4_PREFIX_MAP_FLAGS "-ffile-prefix-map=${CMAKE_SYSROOT}=.")
+    if(EXISTS "${CMAKE_SYSROOT}")
+      file(REAL_PATH "${CMAKE_SYSROOT}" _SAN4_REAL_SYSROOT)
+      list(APPEND SAN4_PREFIX_MAP_FLAGS "-ffile-prefix-map=${_SAN4_REAL_SYSROOT}=.")
+    endif()
   endif()
+  list(REMOVE_DUPLICATES SAN4_PREFIX_MAP_FLAGS)
 endif()
-list(REMOVE_DUPLICATES SAN4_PREFIX_MAP_FLAGS)
 
 set(SAN4_WARNING_FLAGS
   -Wall
@@ -202,6 +221,13 @@ elseif(SAN4_ENABLE_TSAN)
   set(SAN4_SANITIZER_LINK_FLAGS -fsanitize=thread)
 endif()
 
+set(SAN4_COVERAGE_COMPILE_FLAGS "")
+set(SAN4_COVERAGE_LINK_FLAGS "")
+if(SAN4_ENABLE_COVERAGE)
+  set(SAN4_COVERAGE_COMPILE_FLAGS -fprofile-instr-generate -fcoverage-mapping)
+  set(SAN4_COVERAGE_LINK_FLAGS -fprofile-instr-generate)
+endif()
+
 # Standalone GPL-2.0-or-later DBOPL synthesizer target
 add_library(san4_opl STATIC
   src/opl/dbopl.cpp
@@ -213,19 +239,23 @@ target_compile_options(san4_opl PRIVATE
   ${SAN4_LTO_COMPILE_FLAGS}
   ${SAN4_PGO_COMPILE_FLAGS}
   ${SAN4_SANITIZER_COMPILE_FLAGS}
+  ${SAN4_COVERAGE_COMPILE_FLAGS}
 )
 target_link_options(san4_opl PUBLIC
   ${SAN4_PGO_LINK_FLAGS}
   ${SAN4_SANITIZER_LINK_FLAGS}
+  ${SAN4_COVERAGE_LINK_FLAGS}
 )
 
 # Clean-room C++20 runtime library
 set(SAN4_CORE_SOURCES
   src/game_manifest.cpp
+  src/runtime_cli.cpp
   src/video.cpp
   src/upscaler.cpp
   src/hd_gen/san4_codecs.cpp
   src/hd_gen/hd_art_upscaler.cpp
+  src/hd_gen/hd_pack_generator.cpp
   src/hd_pack.cpp
   src/audio.cpp
   src/dos/vfs.cpp
@@ -258,6 +288,7 @@ target_link_options(san4_core PUBLIC
   ${SAN4_LTO_LINK_FLAGS}
   ${SAN4_PGO_LINK_FLAGS}
   ${SAN4_SANITIZER_LINK_FLAGS}
+  ${SAN4_COVERAGE_LINK_FLAGS}
 )
 target_link_libraries(san4_core PUBLIC
   san4_opl
@@ -272,6 +303,7 @@ target_compile_options(san4_core PRIVATE
   ${SAN4_LTO_COMPILE_FLAGS}
   ${SAN4_PGO_COMPILE_FLAGS}
   ${SAN4_SANITIZER_COMPILE_FLAGS}
+  ${SAN4_COVERAGE_COMPILE_FLAGS}
 )
 
 # Primary executable (uses portable $ORIGIN-relative BUILD_RPATH only when
@@ -285,11 +317,13 @@ target_compile_options(san4-linux PRIVATE
   ${SAN4_LTO_COMPILE_FLAGS}
   ${SAN4_PGO_COMPILE_FLAGS}
   ${SAN4_SANITIZER_COMPILE_FLAGS}
+  ${SAN4_COVERAGE_COMPILE_FLAGS}
 )
 target_link_options(san4-linux PRIVATE
   ${SAN4_PGO_LINK_FLAGS}
   ${SAN4_BOLT_LINK_FLAGS}
   ${SAN4_SANITIZER_LINK_FLAGS}
+  ${SAN4_COVERAGE_LINK_FLAGS}
 )
 set_target_properties(san4-linux PROPERTIES
   BUILD_WITH_INSTALL_RPATH FALSE
@@ -317,10 +351,12 @@ target_compile_options(san4-hdpack-gen PRIVATE
   ${SAN4_LTO_COMPILE_FLAGS}
   ${SAN4_PGO_COMPILE_FLAGS}
   ${SAN4_SANITIZER_COMPILE_FLAGS}
+  ${SAN4_COVERAGE_COMPILE_FLAGS}
 )
 target_link_options(san4-hdpack-gen PRIVATE
   ${SAN4_PGO_LINK_FLAGS}
   ${SAN4_SANITIZER_LINK_FLAGS}
+  ${SAN4_COVERAGE_LINK_FLAGS}
 )
 set_target_properties(san4-hdpack-gen PROPERTIES
   BUILD_WITH_INSTALL_RPATH FALSE
@@ -350,10 +386,12 @@ target_compile_options(san4_tests PRIVATE
   ${SAN4_LTO_COMPILE_FLAGS}
   ${SAN4_PGO_COMPILE_FLAGS}
   ${SAN4_SANITIZER_COMPILE_FLAGS}
+  ${SAN4_COVERAGE_COMPILE_FLAGS}
 )
 target_link_options(san4_tests PRIVATE
   ${SAN4_PGO_LINK_FLAGS}
   ${SAN4_SANITIZER_LINK_FLAGS}
+  ${SAN4_COVERAGE_LINK_FLAGS}
 )
 set_target_properties(san4_tests PROPERTIES
   BUILD_WITH_INSTALL_RPATH FALSE
@@ -366,6 +404,14 @@ add_test(NAME clean_repo_hygiene
 if(NOT CMAKE_CROSSCOMPILING)
   add_test(NAME cmake_lto_options_contract
     COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cmake_lto_options.sh")
+  add_test(NAME san4_cli_entrypoints
+    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli_entrypoints.sh"
+      $<TARGET_FILE:san4-linux>
+      $<TARGET_FILE:san4-hdpack-gen>)
+  if(SAN4_ENABLE_TSAN)
+    set_tests_properties(san4_cli_entrypoints PROPERTIES ENVIRONMENT
+      "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
+  endif()
 endif()
 if(NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR)
   add_test(NAME san4_unit_conformance COMMAND san4_tests)

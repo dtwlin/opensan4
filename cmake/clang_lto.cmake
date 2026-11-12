@@ -25,7 +25,8 @@ set(_san4_default_lto OFF)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang"
    AND NOT _san4_build_type_upper STREQUAL "DEBUG"
    AND NOT SAN4_ENABLE_SANITIZERS
-   AND NOT SAN4_ENABLE_TSAN)
+   AND NOT SAN4_ENABLE_TSAN
+   AND NOT SAN4_ENABLE_COVERAGE)
   set(_san4_default_lto ON)
 endif()
 
@@ -186,6 +187,11 @@ if(SAN4_ENABLE_LTO)
       "SAN4_ENABLE_LTO is ON while sanitizer instrumentation is enabled; "
       "skipping LTO so sanitizer runtime linking remains clean.")
     set(_san4_lto_status_summary "OFF (skipped for sanitizers)")
+  elseif(SAN4_ENABLE_COVERAGE)
+    message(WARNING
+      "SAN4_ENABLE_LTO is ON while coverage instrumentation is enabled; "
+      "skipping LTO so llvm-cov source mapping remains exact.")
+    set(_san4_lto_status_summary "OFF (skipped for coverage)")
   else()
     set(SAN4_LTO_ACTIVE ON)
   endif()
