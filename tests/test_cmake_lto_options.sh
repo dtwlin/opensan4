@@ -184,4 +184,30 @@ if out="$("${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${WORK_DIR}/bad_x86emu_override" \
 fi
 assert_contains "${out}" "SAN4_PGO_X86EMU_LIB" "missing SAN4_PGO_X86EMU_LIB rejection"
 
-echo "[cmake-lto-test OK] All CMake Clang/LTO/PGO/BOLT contract checks passed."
+# 12. SAN4_EMBED_GAME_DIR contract checks: missing directory, incomplete game
+#     directory, and mutual exclusion with SAN4_CI_NO_GAME=ON must all fail fast.
+if out="$("${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${WORK_DIR}/embed_missing_dir" \
+    -DSAN4_EMBED_GAME_DIR="${WORK_DIR}/no_such_dir" 2>&1)"; then
+  fail "SAN4_EMBED_GAME_DIR pointing to missing directory unexpectedly succeeded"
+fi
+assert_contains "${out}" "SAN4_EMBED_GAME_DIR does not exist or is not a directory" \
+  "missing SAN4_EMBED_GAME_DIR rejection"
+
+mkdir -p "${WORK_DIR}/empty_embed_dir"
+if out="$("${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${WORK_DIR}/embed_empty_dir" \
+    -DSAN4_EMBED_GAME_DIR="${WORK_DIR}/empty_embed_dir" 2>&1)"; then
+  fail "SAN4_EMBED_GAME_DIR pointing to empty directory unexpectedly succeeded"
+fi
+assert_contains "${out}" "Embedded game file verification failed" \
+  "empty SAN4_EMBED_GAME_DIR manifest rejection"
+assert_contains "${out}" "Missing: EDMUSIC.S4" \
+  "empty SAN4_EMBED_GAME_DIR missing file detail"
+
+if out="$("${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${WORK_DIR}/embed_ci_conflict" \
+    -DSAN4_CI_NO_GAME=ON -DSAN4_EMBED_GAME_DIR="${WORK_DIR}/empty_embed_dir" 2>&1)"; then
+  fail "SAN4_EMBED_GAME_DIR + SAN4_CI_NO_GAME=ON unexpectedly succeeded"
+fi
+assert_contains "${out}" "SAN4_EMBED_GAME_DIR cannot be combined with SAN4_CI_NO_GAME=ON" \
+  "SAN4_EMBED_GAME_DIR + SAN4_CI_NO_GAME mutual exclusion"
+
+echo "[cmake-lto-test OK] All CMake Clang/LTO/PGO/BOLT/Embed contract checks passed."

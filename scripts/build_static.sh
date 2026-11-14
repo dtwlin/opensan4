@@ -26,6 +26,7 @@ clean_build=0
 run_tests=0
 no_game=0
 game_dir="${SAN4_GAME_DIR:-}"
+embed_game_dir="${SAN4_EMBED_GAME_DIR:-}"
 hd_pack_dir="${SAN4_HD_PACK_DIR:-}"
 deps_args=()
 cmake_args=()
@@ -37,16 +38,17 @@ Usage: build_static.sh [options] [extra cmake configure args...]
 Builds self-contained portable san4-linux and san4-hdpack-gen binaries.
 
 Options:
-  --clang-lto        Build static deps & binaries with Clang + Full LTO
-  --thin-lto         Build static deps & binaries with Clang + ThinLTO
-  --lto              Enable LTO (GCC -flto=auto unless --clang-lto is also set)
-  --pgo              Enable 2-stage LLVM IR PGO (implies --clang-lto; instruments libx86emu.a)
-  --bolt             Enable post-link llvm-bolt optimization (implies --clang-lto)
-  --pgo-bolt         Enable both LLVM IR PGO and post-link llvm-bolt (implies --clang-lto)
-  --bolt-relocs      Emit -Wl,--emit-relocs without running llvm-bolt (implies --clang-lto)
-  --game-dir <DIR>   Path to original SAN4 DOS game directory (read-only)
-  --hd-pack <DIR>    Path to generated 4x HD asset pack for PGO/BOLT training
-  --no-game          Build and train using synthetic suites without game files
+  --clang-lto            Build static deps & binaries with Clang + Full LTO
+  --thin-lto             Build static deps & binaries with Clang + ThinLTO
+  --lto                  Enable LTO (GCC -flto=auto unless --clang-lto is also set)
+  --pgo                  Enable 2-stage LLVM IR PGO (implies --clang-lto; instruments libx86emu.a)
+  --bolt                 Enable post-link llvm-bolt optimization (implies --clang-lto)
+  --pgo-bolt             Enable both LLVM IR PGO and post-link llvm-bolt (implies --clang-lto)
+  --bolt-relocs          Emit -Wl,--emit-relocs without running llvm-bolt (implies --clang-lto)
+  --game-dir <DIR>       Path to original SAN4 DOS game directory (external BYOG, read-only)
+  --embed-game-dir <DIR> Embed verified 43 SAN4 files into standalone san4-linux (personal use only)
+  --hd-pack <DIR>        Path to generated 4x HD asset pack for PGO/BOLT training
+  --no-game              Build and train using synthetic suites without game files
   --build-dir <DIR>  Build directory (default: SAN4_STATIC_BUILD_DIR or ./build-static)
   --prefix <DIR>     Static dependency prefix (overrides SAN4_STATIC_PREFIX)
   --clean            Remove the build directory before configuring
@@ -115,6 +117,15 @@ while (( $# > 0 )); do
       game_dir="${1#*=}"
       shift
       ;;
+    --embed-game-dir)
+      [[ $# -ge 2 ]] || { echo "error: --embed-game-dir requires an argument" >&2; exit 2; }
+      embed_game_dir="$2"
+      shift 2
+      ;;
+    --embed-game-dir=*)
+      embed_game_dir="${1#*=}"
+      shift
+      ;;
     --hd-pack)
       [[ $# -ge 2 ]] || { echo "error: --hd-pack requires an argument" >&2; exit 2; }
       hd_pack_dir="$2"
@@ -175,12 +186,17 @@ while (( $# > 0 )); do
 done
 
 has_cmake_game_dir=0
+has_cmake_embed_game_dir=0
 has_cmake_ci_no_game=0
 for arg in "${cmake_args[@]}"; do
   case "${arg}" in
     -DSAN4_GAME_DIR=*|-DSAN4_GAME_DIR:PATH=*)
       has_cmake_game_dir=1
       [[ -n "${game_dir}" ]] || game_dir="${arg#*=}"
+      ;;
+    -DSAN4_EMBED_GAME_DIR=*|-DSAN4_EMBED_GAME_DIR:PATH=*)
+      has_cmake_embed_game_dir=1
+      [[ -n "${embed_game_dir}" ]] || embed_game_dir="${arg#*=}"
       ;;
     -DSAN4_CI_NO_GAME=*)
       has_cmake_ci_no_game=1
@@ -194,7 +210,11 @@ done
 
 if (( no_game )) && (( ! has_cmake_ci_no_game )); then
   cmake_args+=("-DSAN4_CI_NO_GAME=ON")
-elif (( ! no_game )) && [[ -n "${game_dir}" ]] && (( ! has_cmake_game_dir )) && (( ! has_cmake_ci_no_game )); then
+fi
+if (( ! no_game )) && [[ -n "${embed_game_dir}" ]] && (( ! has_cmake_embed_game_dir )) && (( ! has_cmake_ci_no_game )); then
+  cmake_args+=("-DSAN4_EMBED_GAME_DIR=${embed_game_dir}")
+fi
+if (( ! no_game )) && [[ -n "${game_dir}" ]] && (( ! has_cmake_game_dir )) && (( ! has_cmake_ci_no_game )); then
   cmake_args+=("-DSAN4_GAME_DIR=${game_dir}")
 fi
 
@@ -259,7 +279,11 @@ train_args=(--build-dir "${BUILD_DIR}")
 if (( no_game )); then
   train_args+=(--no-game)
 else
-  [[ -z "${game_dir}" ]] || train_args+=(--game-dir "${game_dir}")
+  if [[ -n "${game_dir}" ]]; then
+    train_args+=(--game-dir "${game_dir}")
+  elif [[ -n "${embed_game_dir}" ]]; then
+    train_args+=(--game-dir "${embed_game_dir}")
+  fi
   [[ -z "${hd_pack_dir}" ]] || train_args+=(--hd-pack "${hd_pack_dir}")
 fi
 

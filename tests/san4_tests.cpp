@@ -30,6 +30,7 @@
 
 #include "audio.h"
 #include "dos/dos_kernel.h"
+#include "dos/embedded_vfs.h"
 #include "dos/ems.h"
 #include "dos/mouse.h"
 #include "dos/vfs.h"
@@ -9694,6 +9695,477 @@ void test_machine_grp600c_hle_intercepts_pit_ch0_and_sync_loop() {
   }
 }
 
+void test_embedded_game_vfs_memory_exec_cow_and_cli() {
+  // 1) In clean-room CI / unit-test builds, builtin_embedded_game_archive() is
+  //    strictly nullptr (zero proprietary bytes linked).
+  CHECK(san4::builtin_embedded_game_archive() == nullptr);
+
+  // 2) EmbeddedGameVfs validation of empty lists, invalid DOS 8.3 names,
+  //    duplicate entries, corrupt zlib payloads, CRC-32 mismatches, and slice
+  //    bounds.
+  {
+    std::string err;
+    CHECK(san4::EmbeddedGameVfs::from_raw_files({}, &err) == nullptr);
+    CHECK(!err.empty());
+
+    san4::EmbeddedGameVfs::OwnedPackedArchive empty_packed;
+    err.clear();
+    CHECK(!san4::EmbeddedGameVfs::pack_raw_files({}, empty_packed, &err));
+    CHECK(!err.empty());
+
+    static const std::string_view kBadNames[] = {
+        "",            ".",          "..",         "SUB/A.S4",
+        "SUB\\A.S4",   "TOOLONG99.S","OK.LONGEXT", "A.B.C",
+        "COM1.S4",     "NUL",        "MS$KANJI",   "EMMXXXX0",
+        "TRAIL.",      "SPACE ",
+    };
+    for (std::string_view bad : kBadNames) {
+      const san4::EmbeddedRawFile one{std::string(bad), {0x01u}};
+      CHECK(san4::EmbeddedGameVfs::from_raw_files(
+                std::span<const san4::EmbeddedRawFile>(&one, 1u), &err) ==
+            nullptr);
+      CHECK(!san4::EmbeddedGameVfs::pack_raw_files(
+          std::span<const san4::EmbeddedRawFile>(&one, 1u), empty_packed,
+          &err));
+    }
+
+    const san4::EmbeddedRawFile dup_files[] = {
+        {"data.s4", {1u, 2u}},
+        {"DATA.S4", {3u, 4u}},
+    };
+    CHECK(san4::EmbeddedGameVfs::from_raw_files(dup_files, &err) == nullptr);
+    CHECK(!san4::EmbeddedGameVfs::pack_raw_files(dup_files, empty_packed,
+                                                 &err));
+  }
+
+  // 3) Build a synthetic zlib-packed archive containing:
+  //    - SAN486.COM: shrinks MCB, EXECs CHILD.COM, returns child exit code
+  //    - CHILD.COM: opens ASSET.S4 from MemoryFile, seeks to offset 6, reads
+  //      4 bytes ("MEM!"), closes handle, and exits AL=0x00
+  //    - ASSET.S4: factory-immutable data file ("SYNTH_MEM!_PAYLOAD...")
+  //    - NBDATA.S4: factory-mutable officer data file (256 bytes)
+  const std::vector<std::uint8_t> child_com = {
+      0xBA, 0x3C, 0x01,                    // 0x00: mov dx, 0x013C ("ASSET.S4")
+      0xB8, 0x00, 0x3D,                    // 0x03: mov ax, 0x3D00
+      0xCD, 0x21,                          // 0x06: int 0x21
+      0x72, 0x2B,                          // 0x08: jc fail (0x35)
+      0x89, 0xC3,                          // 0x0A: mov bx, ax
+      0xB8, 0x00, 0x42,                    // 0x0C: mov ax, 0x4200
+      0x31, 0xC9,                          // 0x0F: xor cx, cx
+      0xBA, 0x06, 0x00,                    // 0x11: mov dx, 6
+      0xCD, 0x21,                          // 0x14: int 0x21
+      0x72, 0x1D,                          // 0x16: jc fail (0x35)
+      0xB4, 0x3F,                          // 0x18: mov ah, 0x3F
+      0xB9, 0x04, 0x00,                    // 0x1A: mov cx, 4
+      0xBA, 0x48, 0x01,                    // 0x1D: mov dx, 0x0148
+      0xCD, 0x21,                          // 0x20: int 0x21
+      0x72, 0x11,                          // 0x22: jc fail (0x35)
+      0xB4, 0x3E,                          // 0x24: mov ah, 0x3E
+      0xCD, 0x21,                          // 0x26: int 0x21
+      0x81, 0x3E, 0x48, 0x01, 'M', 'E',    // 0x28: cmp word [0x0148], "ME"
+      0x75, 0x05,                          // 0x2E: jne fail (0x35)
+      0xB8, 0x00, 0x4C,                    // 0x30: mov ax, 0x4C00
+      0xCD, 0x21,                          // 0x33: int 0x21
+      // 0x35 fail:
+      0xB8, 0x77, 0x4C,                    // 0x35: mov ax, 0x4C77
+      0xCD, 0x21,                          // 0x38: int 0x21
+      0x90, 0x90,                          // 0x3A..0x3B: pad to 0x3C
+      // 0x3C -> CS:0x013C: "ASSET.S4\0" (12 bytes -> 0x48)
+      'A', 'S', 'S', 'E', 'T', '.', 'S', '4', 0, 0, 0, 0,
+      // 0x48 -> CS:0x0148: 8-byte read buffer
+      0, 0, 0, 0, 0, 0, 0, 0,
+  };
+
+  const std::vector<std::uint8_t> san486_com = {
+      0xBB, 0x00, 0x01,                    // 0x00: mov bx, 0x0100
+      0xB4, 0x4A,                          // 0x03: mov ah, 0x4A (Resize MCB)
+      0xCD, 0x21,                          // 0x05: int 0x21
+      0x72, 0x15,                          // 0x07: jc err (0x1E)
+      0xBA, 0x28, 0x01,                    // 0x09: mov dx, 0x0128 ("CHILD.COM")
+      0xBB, 0x38, 0x01,                    // 0x0C: mov bx, 0x0138 (param block)
+      0xB8, 0x00, 0x4B,                    // 0x0F: mov ax, 0x4B00 (EXEC)
+      0xCD, 0x21,                          // 0x12: int 0x21
+      0x72, 0x08,                          // 0x14: jc err (0x1E)
+      0xB4, 0x4D,                          // 0x16: mov ah, 0x4D (Get child rc)
+      0xCD, 0x21,                          // 0x18: int 0x21
+      0xB4, 0x4C,                          // 0x1A: mov ah, 0x4C
+      0xCD, 0x21,                          // 0x1C: int 0x21
+      // 0x1E err:
+      0xB8, 0xEE, 0x4C,                    // 0x1E: mov ax, 0x4CEE
+      0xCD, 0x21,                          // 0x21: int 0x21
+      0x90, 0x90, 0x90, 0x90, 0x90,        // 0x23..0x27: pad to 0x28
+      'C', 'H', 'I', 'L', 'D', '.', 'C', 'O', 'M', 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  };
+
+  std::vector<std::uint8_t> asset_bytes(512u, 0x5Au);
+  const char kAssetHdr[] = "SYNTH_MEM!_PAYLOAD";
+  std::memcpy(asset_bytes.data(), kAssetHdr, sizeof(kAssetHdr) - 1u);
+
+  std::vector<std::uint8_t> nbdata_bytes(256u, 0x11u);
+  const char kNbHdr[] = "FACTORY_NBDATA_V1";
+  std::memcpy(nbdata_bytes.data(), kNbHdr, sizeof(kNbHdr) - 1u);
+
+  const san4::EmbeddedRawFile raw_entries[] = {
+      {"san486.com", san486_com},
+      {"child.com", child_com},
+      {"asset.s4", asset_bytes},
+      {"nbdata.s4", nbdata_bytes},
+  };
+
+  {
+    std::string raw_err;
+    auto raw_vfs = san4::EmbeddedGameVfs::from_raw_files(raw_entries, &raw_err);
+    CHECK(raw_vfs != nullptr && raw_err.empty());
+    CHECK(!raw_vfs->empty());
+    CHECK(raw_vfs->file_count() == 4u);
+    CHECK(raw_vfs->contains_file("asset.s4"));
+    CHECK(!raw_vfs->contains_file("sub/asset.s4"));
+    CHECK(raw_vfs->find_file("sub/asset.s4").empty());
+    CHECK(raw_vfs->find_file("missing.s4").empty());
+    CHECK(raw_vfs->entries().size() == 4u);
+  }
+
+  san4::EmbeddedGameVfs::OwnedPackedArchive packed;
+  std::string pack_err;
+  CHECK(san4::EmbeddedGameVfs::pack_raw_files(raw_entries, packed, &pack_err));
+  CHECK(pack_err.empty());
+  CHECK(packed.view.compressed_size > 0u);
+
+  auto embedded = san4::EmbeddedGameVfs::from_packed(packed.view, &pack_err);
+  CHECK(embedded != nullptr && pack_err.empty());
+  CHECK(embedded->file_count() == 4u);
+  CHECK(embedded->total_bytes() ==
+        san486_com.size() + child_com.size() + asset_bytes.size() +
+            nbdata_bytes.size());
+
+  // Verify corruption and invalid metadata rejection on from_packed:
+  {
+    std::string bad_err;
+    san4::EmbeddedPackedArchive bad = packed.view;
+    bad.file_count = 0u;
+    CHECK(san4::EmbeddedGameVfs::from_packed(bad, &bad_err) == nullptr);
+
+    bad = packed.view;
+    bad.compressed_data = nullptr;
+    CHECK(san4::EmbeddedGameVfs::from_packed(bad, &bad_err) == nullptr);
+
+    bad = packed.view;
+    bad.uncompressed_crc32 ^= 0xDEADBEEFu;
+    CHECK(san4::EmbeddedGameVfs::from_packed(bad, &bad_err) == nullptr);
+    CHECK(bad_err.find("CRC-32") != std::string::npos);
+
+    std::vector<std::uint8_t> corrupt_comp = packed.compressed_blob;
+    corrupt_comp[corrupt_comp.size() / 2u] ^= 0xFFu;
+    bad = packed.view;
+    bad.compressed_data = corrupt_comp.data();
+    CHECK(san4::EmbeddedGameVfs::from_packed(bad, &bad_err) == nullptr);
+
+    san4::EmbeddedFileDesc oob_desc{"ASSET.S4", 999999u, 64u};
+    bad = packed.view;
+    bad.files = &oob_desc;
+    bad.file_count = 1u;
+    CHECK(san4::EmbeddedGameVfs::from_packed(bad, &bad_err) == nullptr);
+
+    san4::EmbeddedFileDesc null_name_desc{nullptr, 0u, 1u};
+    bad = packed.view;
+    bad.files = &null_name_desc;
+    bad.file_count = 1u;
+    CHECK(san4::EmbeddedGameVfs::from_packed(bad, &bad_err) == nullptr);
+  }
+
+  // 4) Boot X86Machine with ZERO game_dir on disk + exercise MemoryFile I/O,
+  //    immutable AL=02h fallback, NBDATA.S4 CoW materialization & override,
+  //    SAVEDAT.S4 creation, and FindFirst/FindNext deduplication!
+  ScopedTempDir tmp;
+  const auto save_dir = tmp.path() / "saves";
+  std::filesystem::create_directories(save_dir);
+
+  {
+    san4::MachineConfig cfg;
+    cfg.save_dir = save_dir;
+    cfg.embedded_vfs = embedded;
+    san4::X86Machine m(cfg);
+    CHECK(m.boot("SAN486.COM"));
+    m.step_instructions(600u);
+    CHECK(m.exited());
+    CHECK(m.exit_code() == 0x00u);
+
+    x86emu_t* emu = m.emu();
+    x86emu_set_seg_register(emu, emu->x86.R_DS_SEL, 0x2000u);
+    std::memcpy(m.guest_ram() + 0x20000u, "ASSET.S4\0", 9u);
+    std::memcpy(m.guest_ram() + 0x20020u, "NBDATA.S4\0", 10u);
+    std::memcpy(m.guest_ram() + 0x20040u, "SAVEDAT.S4\0", 11u);
+    std::memcpy(m.guest_ram() + 0x20060u, "*.S4\0", 5u);
+    std::memcpy(m.guest_ram() + 0x20080u, "USER_OFFICER_V2!", 16u);
+    std::memcpy(m.guest_ram() + 0x200A0u, "NEW_SAVE_PAYLOAD", 16u);
+
+    // AH=43h Get/Set Attributes on embedded files.
+    emu->x86.R_AX = 0x4300u;
+    emu->x86.R_DX = 0x0000u;  // ASSET.S4 (immutable -> 0x0001)
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_CX == 0x0001u);
+
+    emu->x86.R_AX = 0x4301u;  // SetAttr on immutable embedded -> AX=5
+    emu->x86.R_CX = 0x0020u;
+    emu->x86.R_DX = 0x0000u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) != 0u && emu->x86.R_AX == 5u);
+
+    emu->x86.R_AX = 0x4300u;
+    emu->x86.R_DX = 0x0020u;  // NBDATA.S4 (mutable -> 0x0020)
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_CX == 0x0020u);
+
+    // Open immutable ASSET.S4 with AL=02h (want_write): must fall back to
+    // read-only MemoryFile WITHOUT polluting save_dir!
+    emu->x86.R_AX = 0x3D02u;
+    emu->x86.R_DX = 0x0000u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u);
+    const std::uint16_t asset_fh = emu->x86.R_AX;
+    CHECK(!std::filesystem::exists(save_dir / "ASSET.S4"));
+
+    // IOCTL AL=00h -> regular file on C: (0x0002), AL=06h -> input ready (0xFF).
+    emu->x86.R_AX = 0x4400u;
+    emu->x86.R_BX = asset_fh;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_DX == 0x0002u);
+
+    emu->x86.R_AX = 0x4406u;
+    emu->x86.R_BX = asset_fh;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_AL == 0xFFu);
+
+    // Write to read-only MemoryFile must fail with AX=5 (Access Denied).
+    emu->x86.R_AH = 0x40u;
+    emu->x86.R_BX = asset_fh;
+    emu->x86.R_CX = 4u;
+    emu->x86.R_DX = 0x0080u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) != 0u && emu->x86.R_AX == 5u);
+
+    // Seek CUR (+6), Read 4 bytes ("MEM!"), Seek END (0) -> IOCTL AL=06h == 0x00.
+    emu->x86.R_AX = 0x4201u;
+    emu->x86.R_BX = asset_fh;
+    emu->x86.R_CX = 0u;
+    emu->x86.R_DX = 6u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_AX == 6u);
+
+    emu->x86.R_AH = 0x3Fu;
+    emu->x86.R_BX = asset_fh;
+    emu->x86.R_CX = 4u;
+    emu->x86.R_DX = 0x0500u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_AX == 4u);
+    CHECK(std::memcmp(m.guest_ram() + 0x20500u, "MEM!", 4u) == 0);
+
+    emu->x86.R_AX = 0x4202u;
+    emu->x86.R_BX = asset_fh;
+    emu->x86.R_CX = 0u;
+    emu->x86.R_DX = 0u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u &&
+          emu->x86.R_AX == static_cast<std::uint16_t>(asset_bytes.size()));
+
+    emu->x86.R_AX = 0x4406u;
+    emu->x86.R_BX = asset_fh;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_AL == 0x00u);
+
+    // Invalid seek origin AL=09h -> CF=1, AX=1.
+    emu->x86.R_AX = 0x4209u;
+    emu->x86.R_BX = asset_fh;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) != 0u && emu->x86.R_AX == 1u);
+
+    // Commit AH=68h on MemoryFile is a clean no-op, then Close AH=3Eh.
+    emu->x86.R_AH = 0x68u;
+    emu->x86.R_BX = asset_fh;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u);
+
+    emu->x86.R_AH = 0x3Eu;
+    emu->x86.R_BX = asset_fh;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u);
+
+    // Read-only open of NBDATA.S4 reads from MemoryFile without copying yet.
+    emu->x86.R_AX = 0x3D00u;
+    emu->x86.R_DX = 0x0020u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u);
+    const std::uint16_t nb_ro_fh = emu->x86.R_AX;
+    CHECK(!std::filesystem::exists(save_dir / "NBDATA.S4"));
+    emu->x86.R_AH = 0x3Eu;
+    emu->x86.R_BX = nb_ro_fh;
+    m.dos().handle_int21(emu);
+
+    // Read/write open (AL=02h) of NBDATA.S4 materializes 256 bytes into save_dir!
+    emu->x86.R_AX = 0x3D02u;
+    emu->x86.R_DX = 0x0020u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u);
+    const std::uint16_t nb_rw_fh = emu->x86.R_AX;
+    CHECK(std::filesystem::exists(save_dir / "NBDATA.S4"));
+    CHECK(std::filesystem::file_size(save_dir / "NBDATA.S4") ==
+          nbdata_bytes.size());
+
+    emu->x86.R_AH = 0x40u;
+    emu->x86.R_BX = nb_rw_fh;
+    emu->x86.R_CX = 16u;
+    emu->x86.R_DX = 0x0080u;  // "USER_OFFICER_V2!"
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_AX == 16u);
+    emu->x86.R_AH = 0x3Eu;
+    emu->x86.R_BX = nb_rw_fh;
+    m.dos().handle_int21(emu);
+
+    // Create SAVEDAT.S4 via AH=3Ch and write 16 bytes.
+    emu->x86.R_AX = 0x3C00u;
+    emu->x86.R_CX = 0u;
+    emu->x86.R_DX = 0x0040u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u);
+    const std::uint16_t sav_fh = emu->x86.R_AX;
+    emu->x86.R_AH = 0x40u;
+    emu->x86.R_BX = sav_fh;
+    emu->x86.R_CX = 16u;
+    emu->x86.R_DX = 0x00A0u;
+    m.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) == 0u && emu->x86.R_AX == 16u);
+    emu->x86.R_AH = 0x3Eu;
+    emu->x86.R_BX = sav_fh;
+    m.dos().handle_int21(emu);
+
+    // FindFirst/FindNext "*.S4" merges save_dir + embedded_vfs deduplicated!
+    emu->x86.R_AH = 0x1Au;
+    emu->x86.R_DX = 0x0600u;
+    m.dos().handle_int21(emu);
+
+    std::vector<std::string> found;
+    emu->x86.R_AH = 0x4Eu;
+    emu->x86.R_CX = 0u;
+    emu->x86.R_DX = 0x0060u;
+    m.dos().handle_int21(emu);
+    while ((emu->x86.R_FLG & FB_CF) == 0u) {
+      found.emplace_back(
+          reinterpret_cast<const char*>(m.guest_ram() + 0x2061Eu));
+      emu->x86.R_AH = 0x4Fu;
+      m.dos().handle_int21(emu);
+    }
+    const std::vector<std::string> expected_s4 = {
+        "ASSET.S4", "NBDATA.S4", "SAVEDAT.S4"};
+    CHECK(found == expected_s4);
+  }
+
+  // Reopen on a fresh X86Machine instance: modified NBDATA.S4 in save_dir must
+  // override the embedded factory NBDATA.S4!
+  {
+    san4::MachineConfig cfg2;
+    cfg2.save_dir = save_dir;
+    cfg2.embedded_vfs = embedded;
+    san4::X86Machine m2(cfg2);
+    std::vector<std::uint8_t> nb_reloaded;
+    san4::CaseInsensitiveVfs check_vfs({}, save_dir);
+    check_vfs.set_embedded_vfs(embedded);
+    CHECK(check_vfs.embedded_vfs() == embedded);
+    CHECK(check_vfs.read_all_bytes("nbdata.s4", nb_reloaded));
+    CHECK(nb_reloaded.size() == nbdata_bytes.size());
+    CHECK(std::memcmp(nb_reloaded.data(), "USER_OFFICER_V2!", 16u) == 0);
+
+    // Without save_dir, AL=02h on embedded NBDATA.S4 must return AX=5 (Access Denied).
+    san4::MachineConfig no_save_cfg;
+    no_save_cfg.embedded_vfs = embedded;
+    san4::X86Machine m_nosave(no_save_cfg);
+    x86emu_t* emu = m_nosave.emu();
+    x86emu_set_seg_register(emu, emu->x86.R_DS_SEL, 0x2000u);
+    std::memcpy(m_nosave.guest_ram() + 0x20000u, "NBDATA.S4\0", 10u);
+    emu->x86.R_AX = 0x3D02u;
+    emu->x86.R_DX = 0x0000u;
+    m_nosave.dos().handle_int21(emu);
+    CHECK((emu->x86.R_FLG & FB_CF) != 0u && emu->x86.R_AX == 5u);
+  }
+
+  // 5) Full run_runtime_cli execution in standalone embedded mode with ZERO
+  //    SAN4 directory on disk (both headless & interactive + error paths).
+  {
+    ScopedEnvVar no_dlg("SAN4_NO_ERROR_DIALOG", "1");
+    ScopedEnvVar clr_game("SAN4_GAME_DIR", nullptr);
+    ScopedEnvVar vid_drv("SDL_VIDEODRIVER", "dummy");
+    ScopedEnvVar aud_drv("SDL_AUDIODRIVER", "dummy");
+
+    const auto isolated = tmp.path() / "empty_room";
+    const auto xdg_root = tmp.path() / "xdg_user_data";
+    const auto hd_dir = isolated / "hd_pack";
+    std::filesystem::create_directories(isolated);
+    std::filesystem::create_directories(xdg_root);
+    std::filesystem::create_directories(hd_dir);
+    {
+      std::ofstream mf(hd_dir / "hd_manifest.tsv", std::ios::binary);
+      mf << "# synthetic hd manifest\n";
+    }
+    ScopedCurrentDir cwd_guard(isolated);
+    ScopedEnvVar xdg_env("XDG_DATA_HOME",
+                         san4::util::path_to_utf8(xdg_root).c_str());
+    ScopedEnvVar local_app_env("LOCALAPPDATA",
+                               san4::util::path_to_utf8(xdg_root).c_str());
+
+    // 5a) Headless without --save-dir uses scoped temp dir and leaves xdg_root clean!
+    std::ostringstream out, err;
+    CHECK(san4::run_runtime_cli({"san4", "--headless-script=frames:2;quit"},
+                                "san4", isolated / "san4", out, err, true,
+                                &packed.view) == 0);
+    CHECK(std::filesystem::is_empty(xdg_root));
+
+    // 5b) Interactive without --save-dir creates persistent user save dir and
+    //     auto-discovers optional hd_pack next to the executable!
+    out.str("");
+    err.str("");
+    CHECK(san4::run_runtime_cli({"san4"}, "san4", isolated / "san4", out, err,
+                                true, &packed.view) == 0);
+#ifdef _WIN32
+    CHECK(std::filesystem::is_directory(xdg_root / "SAN4" / "saves"));
+#else
+    CHECK(std::filesystem::is_directory(xdg_root / "san4" / "saves"));
+#endif
+
+    // 5c) Corrupted embedded archive returns exit 1 cleanly.
+    san4::EmbeddedPackedArchive corrupt_view = packed.view;
+    corrupt_view.uncompressed_crc32 ^= 0x12345678u;
+    out.str("");
+    err.str("");
+    CHECK(san4::run_runtime_cli({"san4", "--headless-script=quit"}, "san4",
+                                isolated / "san4", out, err, true,
+                                &corrupt_view) == 1);
+    CHECK(err.str().find("Embedded game archive verification failed") !=
+          std::string::npos);
+
+    // 5d) Explicit --game-dir still enforces external BYOG verification!
+    const auto empty_gdir = tmp.path() / "empty_override_gdir";
+    std::filesystem::create_directories(empty_gdir);
+    out.str("");
+    err.str("");
+    CHECK(san4::run_runtime_cli(
+              {"san4", "--game-dir=" + san4::util::path_to_utf8(empty_gdir),
+               "--headless-script=quit"},
+              "san4", isolated / "san4", out, err, true, &packed.view) == 1);
+    CHECK(err.str().find("Bring-Your-Own-Game required") != std::string::npos);
+
+    // 5e) Explicit --save-dir in headless mode preserves custom save directory!
+    const auto explicit_hl_save = tmp.path() / "explicit_hl_saves";
+    out.str("");
+    err.str("");
+    CHECK(san4::run_runtime_cli(
+              {"san4",
+               "--save-dir=" + san4::util::path_to_utf8(explicit_hl_save),
+               "--headless-script=frames:1;quit"},
+              "san4", isolated / "san4", out, err, true, &packed.view) == 0);
+    CHECK(std::filesystem::is_directory(explicit_hl_save));
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -9769,9 +10241,10 @@ int main() {
       test_mouse_hle_complete_int33_contract,
       test_dos_kernel_console_ioctl_tsr_and_video_bios_ports,
       test_machine_grp600c_hle_intercepts_pit_ch0_and_sync_loop,
+      test_embedded_game_vfs_memory_exec_cow_and_cli,
   };
-  static_assert(sizeof(kSuites) / sizeof(kSuites[0]) == 70u);
-  // Invoke through a volatile pointer so LTO/ASan cannot inline all 70 suites'
+  static_assert(sizeof(kSuites) / sizeof(kSuites[0]) == 71u);
+  // Invoke through a volatile pointer so LTO/ASan cannot inline all 71 suites'
   // X86Machine / VesaPlanarVideo stack frames into a single giant main() frame.
   for (SuiteFn suite : kSuites) {
     SuiteFn volatile run = suite;
@@ -9782,6 +10255,6 @@ int main() {
     std::cerr << "[san4_tests] FAILED (" << g_failures << " error(s))\n";
     return 1;
   }
-  std::cout << "[san4_tests] ALL 70 CONFORMANCE & BENCHMARK SUITES PASSED\n";
+  std::cout << "[san4_tests] ALL 71 CONFORMANCE & BENCHMARK SUITES PASSED\n";
   return 0;
 }

@@ -1,6 +1,7 @@
 #include "runtime_cli.h"
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -190,6 +191,18 @@ int run_runtime_cli(const std::vector<std::string>& utf8_args,
                     std::ostream& out_stream,
                     std::ostream& err_stream,
                     bool verify_manifest) {
+  return run_runtime_cli(utf8_args, fallback_prog_name, exe_path_override,
+                         out_stream, err_stream, verify_manifest,
+                         builtin_embedded_game_archive());
+}
+
+int run_runtime_cli(const std::vector<std::string>& utf8_args,
+                    const char* fallback_prog_name,
+                    const std::filesystem::path& exe_path_override,
+                    std::ostream& out_stream,
+                    std::ostream& err_stream,
+                    bool verify_manifest,
+                    const EmbeddedPackedArchive* embedded_archive_override) {
   ParsedRuntimeCli parsed;
   const int parse_rc = parse_runtime_cli(utf8_args, fallback_prog_name, parsed,
                                          out_stream, err_stream);
@@ -211,7 +224,22 @@ int run_runtime_cli(const std::vector<std::string>& utf8_args,
   }
 
   std::filesystem::path resolved_game_dir;
-  if (verify_manifest) {
+  if (parsed.cli_game_dir.empty() && embedded_archive_override != nullptr) {
+    std::string embed_err;
+    auto embedded =
+        EmbeddedGameVfs::from_packed(*embedded_archive_override, &embed_err);
+    if (!embedded) {
+      const std::string err_msg =
+          std::string("[san4] Embedded game archive verification failed: ") +
+          embed_err + "\n";
+      err_stream << err_msg;
+      if (parsed.opts.headless_script.empty()) {
+        win32_platform::show_error_dialog("SAN4 Native Runtime", err_msg);
+      }
+      return 1;
+    }
+    parsed.opts.embedded_vfs = std::move(embedded);
+  } else if (verify_manifest) {
     const ManifestCheckResult check =
         resolve_and_verify_game_dir(parsed.cli_game_dir, exe_path);
     if (!check.ok) {
@@ -245,6 +273,16 @@ int run_runtime_cli(const std::vector<std::string>& utf8_args,
     resolved_game_dir = util::utf8_to_path(parsed.cli_game_dir);
   }
 
+  struct ScopedHeadlessSaveDir {
+    std::filesystem::path path;
+    ~ScopedHeadlessSaveDir() {
+      if (!path.empty()) {
+        std::error_code rm_ec;
+        std::filesystem::remove_all(path, rm_ec);
+      }
+    }
+  } scoped_headless_saves;
+
   HostOptions& opts = parsed.opts;
   std::error_code ec;
   const std::filesystem::path exe_dir =
@@ -261,8 +299,44 @@ int run_runtime_cli(const std::vector<std::string>& utf8_args,
       opts.hd_pack_dir = cand2;
     }
   }
-  if (opts.save_dir.empty() && opts.headless_script.empty() &&
-      !win32_platform::is_game_dir_writable(resolved_game_dir)) {
+  if (opts.embedded_vfs != nullptr && resolved_game_dir.empty()) {
+    if (opts.save_dir.empty()) {
+      if (opts.headless_script.empty()) {
+        std::filesystem::path user_saves =
+            win32_platform::select_user_save_dir(exe_dir);
+        if (user_saves.empty()) {
+          const std::string err_msg =
+              "[san4] Failed to create writable user save directory for "
+              "standalone embedded mode. Pass --save-dir <DIR>.\n";
+          err_stream << err_msg;
+          win32_platform::show_error_dialog("SAN4 Native Runtime", err_msg);
+          return 1;
+        }
+        opts.save_dir = std::move(user_saves);
+      } else {
+        const std::filesystem::path tmp_root =
+            std::filesystem::temp_directory_path(ec);
+        if (!ec && !tmp_root.empty()) {
+          const auto tick = static_cast<unsigned long long>(
+              std::chrono::steady_clock::now().time_since_epoch().count());
+          for (unsigned attempt = 0; attempt < 32u; ++attempt) {
+            std::filesystem::path cand =
+                tmp_root / ("san4_hl_saves_" + std::to_string(tick) + "_" +
+                            std::to_string(attempt));
+            if (!std::filesystem::exists(cand, ec) &&
+                std::filesystem::create_directories(cand, ec) && !ec) {
+              scoped_headless_saves.path = cand;
+              opts.save_dir = std::move(cand);
+              break;
+            }
+          }
+        }
+      }
+    } else {
+      std::filesystem::create_directories(opts.save_dir, ec);
+    }
+  } else if (opts.save_dir.empty() && opts.headless_script.empty() &&
+             !win32_platform::is_game_dir_writable(resolved_game_dir)) {
     std::filesystem::path fallback_saves =
         win32_platform::select_user_save_dir(exe_dir);
     if (!fallback_saves.empty()) {

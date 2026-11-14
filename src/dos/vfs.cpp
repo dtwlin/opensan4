@@ -147,6 +147,13 @@ CaseInsensitiveVfs::CaseInsensitiveVfs(std::filesystem::path root_dir,
   set_directories(std::move(root_dir), std::move(save_dir));
 }
 
+CaseInsensitiveVfs::CaseInsensitiveVfs(
+    std::filesystem::path root_dir, std::filesystem::path save_dir,
+    std::shared_ptr<const EmbeddedGameVfs> embedded_vfs)
+    : embedded_vfs_(std::move(embedded_vfs)) {
+  set_directories(std::move(root_dir), std::move(save_dir));
+}
+
 void CaseInsensitiveVfs::set_directories(std::filesystem::path root_dir,
                                          std::filesystem::path save_dir) {
   root_dir_ = std::move(root_dir);
@@ -235,6 +242,54 @@ std::optional<std::filesystem::path> CaseInsensitiveVfs::resolve_for_read(
   return lookup_case_insensitive(root_dir_, rel);
 }
 
+std::optional<std::span<const std::uint8_t>>
+CaseInsensitiveVfs::resolve_embedded_for_read(std::string_view dos_path) const {
+  if (embedded_vfs_ == nullptr || is_rejected_device(dos_path) ||
+      is_emm_device(dos_path) || is_nul_or_con_device(dos_path)) {
+    return std::nullopt;
+  }
+  const std::string rel = normalize_dos_relpath(dos_path);
+  if (rel.empty() || rel == "." || contains_parent_ref(rel) ||
+      has_invalid_dos_chars(rel) || has_reserved_segment(rel)) {
+    return std::nullopt;
+  }
+  if (!embedded_vfs_->contains_file(rel)) {
+    return std::nullopt;
+  }
+  return embedded_vfs_->find_file(rel);
+}
+
+bool CaseInsensitiveVfs::read_all_bytes(std::string_view dos_path,
+                                        std::vector<std::uint8_t>& out) const {
+  out.clear();
+  if (auto host_path = resolve_for_read(dos_path)) {
+    std::ifstream ifs(*host_path, std::ios::binary | std::ios::ate);
+    if (!ifs) {
+      return false;
+    }
+    const auto end_pos = ifs.tellg();
+    if (end_pos < 0) {
+      return false;
+    }
+    const auto fsize = static_cast<std::size_t>(end_pos);
+    out.resize(fsize);
+    if (fsize > 0u) {
+      ifs.seekg(0, std::ios::beg);
+      if (!ifs.read(reinterpret_cast<char*>(out.data()),
+                    static_cast<std::streamsize>(fsize))) {
+        out.clear();
+        return false;
+      }
+    }
+    return true;
+  }
+  if (auto mem = resolve_embedded_for_read(dos_path)) {
+    out.assign(mem->begin(), mem->end());
+    return true;
+  }
+  return false;
+}
+
 std::optional<std::filesystem::path> CaseInsensitiveVfs::resolve_for_write(
     std::string_view dos_path, bool truncate_or_create) const {
   std::string rel;
@@ -262,8 +317,9 @@ std::optional<std::filesystem::path> CaseInsensitiveVfs::resolve_for_write(
     return existing;
   }
 
+  const std::string upper_rel = util::ascii_upper(rel);
   const std::filesystem::path dst =
-      target_base / util::utf8_to_path(util::ascii_upper(rel));
+      target_base / util::utf8_to_path(upper_rel);
   std::error_code sym_ec;
   const auto dst_st = std::filesystem::symlink_status(dst, sym_ec);
   if (!sym_ec && std::filesystem::is_symlink(dst_st)) {
@@ -282,6 +338,28 @@ std::optional<std::filesystem::path> CaseInsensitiveVfs::resolve_for_write(
             std::filesystem::perm_options::add, perm_ec);
         return dst;
       }
+    } else if (embedded_vfs_ != nullptr &&
+               (upper_rel == "NBDATA.S4" || upper_rel == "SAVEDAT.S4") &&
+               embedded_vfs_->contains_file(upper_rel)) {
+      const auto bytes = embedded_vfs_->find_file(upper_rel);
+      std::ofstream ofs(dst, std::ios::binary | std::ios::trunc);
+      if (ofs &&
+          (bytes.empty() ||
+           ofs.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size())))) {
+        ofs.flush();
+        if (ofs.good()) {
+          ofs.close();
+          std::error_code perm_ec;
+          std::filesystem::permissions(
+              dst,
+              std::filesystem::perms::owner_read |
+                  std::filesystem::perms::owner_write,
+              std::filesystem::perm_options::add, perm_ec);
+          return dst;
+        }
+      }
+      std::filesystem::remove(dst, ec);
     }
     return std::nullopt;
   }
@@ -417,6 +495,20 @@ std::vector<DosDirMatch> CaseInsensitiveVfs::find_matching(
     }
   };
 
+  if (embedded_vfs_ != nullptr && dir_part.empty()) {
+    for (const auto& ent : embedded_vfs_->entries()) {
+      const std::string up_name(ent.dos_name);
+      if (up_name.size() <= 12u && wildcard_match(up_pat, up_name)) {
+        merged[up_name] = DosDirMatch{
+            .dos_name = up_name,
+            .size = static_cast<std::uint32_t>(ent.data.size()),
+            .attr = (up_name == "NBDATA.S4")
+                        ? static_cast<std::uint8_t>(0x20u)
+                        : static_cast<std::uint8_t>(0x01u),
+        };
+      }
+    }
+  }
   scan_dir(root_dir_);
   if (save_dir_ != root_dir_) {
     scan_dir(save_dir_);

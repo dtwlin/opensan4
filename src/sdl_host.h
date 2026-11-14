@@ -31,6 +31,7 @@ struct HostOptions {
   std::filesystem::path save_dir;
   std::filesystem::path hd_pack_dir;
   std::filesystem::path dump_sprites_dir;
+  std::shared_ptr<const EmbeddedGameVfs> embedded_vfs;
   UpscaleMode upscale_mode = UpscaleMode::Sharp2x;
   // `upscale_mode` came from `--scale`; disables the automatic HD-pack scale.
   bool explicit_scale = false;

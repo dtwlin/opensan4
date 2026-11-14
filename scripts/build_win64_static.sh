@@ -27,6 +27,7 @@ package_zip=0
 run_tests=0
 no_game=0
 game_dir="${SAN4_GAME_DIR:-}"
+embed_game_dir="${SAN4_EMBED_GAME_DIR:-}"
 cmake_args=()
 
 usage() {
@@ -39,7 +40,8 @@ Options:
   --clang-lto            Build static deps & PE32+ binaries with Clang + LLD Full LTO (default)
   --thin-lto             Build static deps & PE32+ binaries with Clang + LLD ThinLTO
   --gcc                  Build static deps & PE32+ binaries with MinGW-w64 GCC (POSIX threads)
-  --game-dir <DIR>       Path to original SAN4 DOS game directory (read-only)
+  --game-dir <DIR>       Path to original SAN4 DOS game directory (external BYOG, read-only)
+  --embed-game-dir <DIR> Embed verified 43 SAN4 files into standalone san4.exe (personal use only)
   --no-game              Build without local game files (-DSAN4_CI_NO_GAME=ON)
   --build-dir <DIR>      Build directory (default: SAN4_WIN64_BUILD_DIR or ./build-win64)
   --prefix <DIR>         Static dependency prefix (overrides SAN4_STATIC_PREFIX)
@@ -82,6 +84,15 @@ while (( $# > 0 )); do
       ;;
     --game-dir=*)
       game_dir="${1#*=}"
+      shift
+      ;;
+    --embed-game-dir)
+      [[ $# -ge 2 ]] || { echo "error: --embed-game-dir requires an argument" >&2; exit 2; }
+      embed_game_dir="$2"
+      shift 2
+      ;;
+    --embed-game-dir=*)
+      embed_game_dir="${1#*=}"
       shift
       ;;
     --no-game)
@@ -148,12 +159,17 @@ while (( $# > 0 )); do
 done
 
 has_cmake_game_dir=0
+has_cmake_embed_game_dir=0
 has_cmake_ci_no_game=0
 for arg in "${cmake_args[@]}"; do
   case "${arg}" in
     -DSAN4_GAME_DIR=*|-DSAN4_GAME_DIR:PATH=*)
       has_cmake_game_dir=1
       [[ -n "${game_dir}" ]] || game_dir="${arg#*=}"
+      ;;
+    -DSAN4_EMBED_GAME_DIR=*|-DSAN4_EMBED_GAME_DIR:PATH=*)
+      has_cmake_embed_game_dir=1
+      [[ -n "${embed_game_dir}" ]] || embed_game_dir="${arg#*=}"
       ;;
     -DSAN4_CI_NO_GAME=*)
       has_cmake_ci_no_game=1
@@ -167,7 +183,11 @@ done
 
 if (( no_game )) && (( ! has_cmake_ci_no_game )); then
   cmake_args+=("-DSAN4_CI_NO_GAME=ON")
-elif (( ! no_game )) && [[ -n "${game_dir}" ]] && (( ! has_cmake_game_dir )) && (( ! has_cmake_ci_no_game )); then
+fi
+if (( ! no_game )) && [[ -n "${embed_game_dir}" ]] && (( ! has_cmake_embed_game_dir )) && (( ! has_cmake_ci_no_game )); then
+  cmake_args+=("-DSAN4_EMBED_GAME_DIR=${embed_game_dir}")
+fi
+if (( ! no_game )) && [[ -n "${game_dir}" ]] && (( ! has_cmake_game_dir )) && (( ! has_cmake_ci_no_game )); then
   cmake_args+=("-DSAN4_GAME_DIR=${game_dir}")
 fi
 
@@ -311,7 +331,33 @@ LICENSES_OUT="${BUILD_DIR}/THIRD_PARTY_LICENSES.txt"
 
 if (( package_zip )); then
   README_WIN="${BUILD_DIR}/README-WINDOWS.txt"
-  cat > "${README_WIN}" << 'WINEOF'
+  if [[ -n "${embed_game_dir}" ]]; then
+    cat > "${README_WIN}" << 'WINEOF'
+OpenSan4 - Native Windows 11 x86_64 (Personal Standalone Single-EXE Build)
+==========================================================================
+
+IMPORTANT PERSONAL-USE NOTICE:
+  This san4.exe was locally built with --embed-game-dir and embeds your own
+  43 original DOS game files in memory. It is strictly for your personal local
+  use — DO NOT redistribute san4.exe.
+
+Quick Start (Windows Explorer Double-Click):
+--------------------------------------------
+1. Copy san4.exe (or extract this folder) anywhere on your PC.
+2. Double-click san4.exe to play — no external SAN4 folder is needed!
+   - Saves and custom officers (SAVEDAT.S4 / NBDATA.S4) are stored automatically
+     in %LOCALAPPDATA%\SAN4\saves.
+   - If an optional "hd_pack" folder is placed next to san4.exe, 4x HD graphics
+     are loaded automatically.
+
+Command-Line Options (PowerShell / cmd.exe):
+--------------------------------------------
+  .\san4.exe --hd-pack C:\path\to\hd_pack
+  .\san4.exe --save-dir C:\path\to\saves
+  .\san4.exe --help
+WINEOF
+  else
+    cat > "${README_WIN}" << 'WINEOF'
 OpenSan4 - Native Windows 11 x86_64 (Self-Contained Portable Build)
 ===================================================================
 
@@ -338,6 +384,7 @@ Command-Line Options (PowerShell / cmd.exe):
   .\san4.exe --help
   .\san4-hdpack-gen.exe --help
 WINEOF
+  fi
 
   ZIP_OUT="${BUILD_DIR}/san4-win64-portable.zip"
   ZIP_ARGS=(

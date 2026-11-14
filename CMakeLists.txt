@@ -63,6 +63,8 @@ option(SAN4_STATIC "Link SDL2, libx86emu, libpng, zlib and the C++ runtime stati
 set(SAN4_STATIC_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/third_party/static" CACHE PATH
   "Install prefix populated by scripts/build_static_deps.sh for SAN4_STATIC builds")
 set(SAN4_GAME_DIR "" CACHE PATH "Path to user-supplied original SAN4 DOS game directory")
+set(SAN4_EMBED_GAME_DIR "" CACHE PATH
+  "Optional path to verified 43-file SAN4 directory to embed into standalone runtime binary (personal use only)")
 
 if(SAN4_ENABLE_SANITIZERS AND SAN4_ENABLE_TSAN)
   message(FATAL_ERROR "SAN4_ENABLE_SANITIZERS and SAN4_ENABLE_TSAN are mutually exclusive.")
@@ -111,7 +113,9 @@ if(SAN4_STATIC)
   list(APPEND SAN4_EXTRA_LINK_FLAGS ${SAN4_STATIC_LINK_FLAGS})
 else()
   find_package(PNG REQUIRED)
+  find_package(ZLIB REQUIRED)
   set(SAN4_PNG_LIBRARIES PNG::PNG)
+  set(SAN4_ZLIB_LIBRARIES ZLIB::ZLIB)
 
   # Prefer system SDL2 first; fall back to rootless third_party/sdl2_dev
   find_package(PkgConfig QUIET)
@@ -258,6 +262,7 @@ set(SAN4_CORE_SOURCES
   src/hd_gen/hd_pack_generator.cpp
   src/hd_pack.cpp
   src/audio.cpp
+  src/dos/embedded_vfs.cpp
   src/dos/vfs.cpp
   src/dos/ems.cpp
   src/dos/mouse.cpp
@@ -295,6 +300,7 @@ target_link_libraries(san4_core PUBLIC
   ${SAN4_SDL2_LIBRARIES}
   ${SAN4_X86EMU_LIBRARIES}
   ${SAN4_PNG_LIBRARIES}
+  ${SAN4_ZLIB_LIBRARIES}
   Threads::Threads
 )
 target_compile_options(san4_core PRIVATE
@@ -306,10 +312,30 @@ target_compile_options(san4_core PRIVATE
   ${SAN4_COVERAGE_COMPILE_FLAGS}
 )
 
+if(SAN4_EMBED_ACTIVE)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(_SAN4_EMBED_CPP "${CMAKE_BINARY_DIR}/generated/embedded_game_data.cpp")
+  add_custom_command(
+    OUTPUT "${_SAN4_EMBED_CPP}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/generated"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/generate_embedded_vfs.py"
+            --game-dir "${SAN4_EMBED_GAME_DIR_ABS}"
+            --output "${_SAN4_EMBED_CPP}"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/generate_embedded_vfs.py"
+      ${SAN4_EMBED_DEPENDS_FILES}
+    COMMENT "Packing 43 verified SAN4 files into compressed in-memory VFS (personal use only)"
+    VERBATIM
+  )
+  set(_SAN4_RUNTIME_EMBED_SRC "${_SAN4_EMBED_CPP}")
+else()
+  set(_SAN4_RUNTIME_EMBED_SRC "src/dos/embedded_vfs_stub.cpp")
+endif()
+
 # Primary executable (uses portable $ORIGIN-relative BUILD_RPATH only when
 # bundled third_party/ libraries are active, and never bakes third_party paths
 # into INSTALL_RPATH).
-add_executable(san4-linux src/main.cpp)
+add_executable(san4-linux src/main.cpp "${_SAN4_RUNTIME_EMBED_SRC}")
 target_link_libraries(san4-linux PRIVATE san4_core)
 target_compile_options(san4-linux PRIVATE
   ${SAN4_WARNING_FLAGS}
@@ -343,7 +369,10 @@ if(WIN32)
 endif()
 
 # Clean-room BYOG 4x HD asset pack generator CLI
-add_executable(san4-hdpack-gen src/hd_gen/hdpack_gen_main.cpp)
+add_executable(san4-hdpack-gen
+  src/hd_gen/hdpack_gen_main.cpp
+  src/dos/embedded_vfs_stub.cpp
+)
 target_link_libraries(san4-hdpack-gen PRIVATE san4_core)
 target_compile_options(san4-hdpack-gen PRIVATE
   ${SAN4_WARNING_FLAGS}
@@ -377,6 +406,7 @@ add_executable(san4_tests
   tests/san4_tests.cpp
   tests/reference/hd_art_upscaler_ref.cpp
   tests/reference/hd_composite_ref.cpp
+  src/dos/embedded_vfs_stub.cpp
 )
 target_include_directories(san4_tests PRIVATE tests)
 target_link_libraries(san4_tests PRIVATE san4_core)

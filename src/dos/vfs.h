@@ -2,10 +2,14 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "dos/embedded_vfs.h"
 
 namespace san4 {
 
@@ -22,12 +26,21 @@ class CaseInsensitiveVfs {
   CaseInsensitiveVfs() = default;
   explicit CaseInsensitiveVfs(std::filesystem::path root_dir,
                               std::filesystem::path save_dir = {});
+  CaseInsensitiveVfs(std::filesystem::path root_dir,
+                     std::filesystem::path save_dir,
+                     std::shared_ptr<const EmbeddedGameVfs> embedded_vfs);
 
   void set_directories(std::filesystem::path root_dir,
                        std::filesystem::path save_dir = {});
+  void set_embedded_vfs(std::shared_ptr<const EmbeddedGameVfs> embedded_vfs) {
+    embedded_vfs_ = std::move(embedded_vfs);
+  }
 
   const std::filesystem::path& root_dir() const { return root_dir_; }
   const std::filesystem::path& save_dir() const { return save_dir_; }
+  const std::shared_ptr<const EmbeddedGameVfs>& embedded_vfs() const {
+    return embedded_vfs_;
+  }
 
   static bool is_rejected_device(std::string_view dos_path);
   static bool is_emm_device(std::string_view dos_path);
@@ -37,6 +50,10 @@ class CaseInsensitiveVfs {
 
   std::optional<std::filesystem::path> resolve_for_read(
       std::string_view dos_path) const;
+  std::optional<std::span<const std::uint8_t>> resolve_embedded_for_read(
+      std::string_view dos_path) const;
+  bool read_all_bytes(std::string_view dos_path,
+                      std::vector<std::uint8_t>& out) const;
   std::optional<std::filesystem::path> resolve_for_write(
       std::string_view dos_path, bool truncate_or_create) const;
   std::optional<std::filesystem::path> resolve_existing_in_write_dir(
@@ -49,6 +66,7 @@ class CaseInsensitiveVfs {
 
   std::filesystem::path root_dir_;
   std::filesystem::path save_dir_;
+  std::shared_ptr<const EmbeddedGameVfs> embedded_vfs_;
 };
 
 }  // namespace san4

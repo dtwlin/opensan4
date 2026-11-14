@@ -6,7 +6,7 @@
 
 ## 法律聲明與自備遊戲檔案（BYOG）須知
 
-- **不包含任何專有遊戲資產**：本儲存庫**僅**包含無塵室開發之執行引擎與素材產生器原始碼、建置指令稿及合成單元測試。本儲存庫與編譯產出之 `san4-linux`、`san4.exe`、`san4-hdpack-gen`、`san4-hdpack-gen.exe` 二進位執行檔中，均未散佈或內嵌任何光榮特庫摩（Koei Co., Ltd. / Koei Tecmo Games Co., Ltd.）之執行檔（`.EXE`、`.COM`）、劇本與資料檔（`.S4`）、字型檔（`.16P`）、音樂、圖像或存檔。
+- **不包含任何專有遊戲資產**：本儲存庫**僅**包含無塵室開發之執行引擎與素材產生器原始碼、建置指令稿及合成單元測試。本儲存庫與預設組態編譯產出之 `san4-linux`、`san4.exe`、`san4-hdpack-gen`、`san4-hdpack-gen.exe` 二進位執行檔中，均未散佈或內嵌任何光榮特庫摩（Koei Co., Ltd. / Koei Tecmo Games Co., Ltd.）之執行檔（`.EXE`、`.COM`）、劇本與資料檔（`.S4`）、字型檔（`.16P`）、音樂、圖像或存檔。（若您在本機自行啟用選用的 `--embed-game-dir`／`-DSAN4_EMBED_GAME_DIR` 模式，將您合法擁有的 `43` 個原版 DOS 檔案封裝成個人單一執行檔，該編譯產出之 `san4` 執行檔因內含您的原版遊戲資產，僅供您個人本機使用——**嚴禁公開散佈或轉發**。）
 - **非官方關聯聲明**：*Romance of the Three Kingdoms*（《三國志》）為光榮特庫摩遊戲（Koei Tecmo Games Co., Ltd.）之註冊商標。本專案為獨立開發之相容性與數位保存執行環境，與光榮特庫摩無任何隸屬、合作或背書關係。
 - **自備原版遊戲檔案（Bring Your Own Game）**：若要執行預設本機建置、在本機產生 HD 高畫質素材包並啟動遊戲，您必須自行準備合法擁有的《三國志 IV》MS-DOS 繁體中文版 `SAN4` 目錄（共 `43` 個原始檔案，於 CMake 設定階段與執行期啟動時皆會驗證檔案大小與 SHA-256 雜湊值）。
 
@@ -74,7 +74,7 @@ ctest --test-dir build --output-on-failure
 
 ### 公開 CI／純引擎建置（無須遊戲檔案）
 
-專案貢獻者與 CI 執行環境無須擁有原版遊戲檔案，即可在開啟嚴格編譯警告（`-Wall -Wextra -Wpedantic -Werror`）下編譯 `san4-linux`、`san4-hdpack-gen` 與 `san4_tests`，並在 ASan + UBSan、ThreadSanitizer（TSan）以及 Clang `llvm-cov` 原始碼級別程式碼覆蓋率檢測下執行全部 `70` 組合成相容性、編解碼器、放大演算法、硬體模擬、並行處理、CLI／宿主環境、LTO／SIMD、安全性與二進位整潔度測試套件：
+專案貢獻者與 CI 執行環境無須擁有原版遊戲檔案，即可在開啟嚴格編譯警告（`-Wall -Wextra -Wpedantic -Werror`）下編譯 `san4-linux`、`san4-hdpack-gen` 與 `san4_tests`，並在 ASan + UBSan、ThreadSanitizer（TSan）以及 Clang `llvm-cov` 原始碼級別程式碼覆蓋率檢測下執行全部 `71` 組合成相容性、編解碼器、放大演算法、硬體模擬、並行處理、CLI／宿主環境、LTO／SIMD、安全性與二進位整潔度測試套件：
 
 ```bash
 # AddressSanitizer + UndefinedBehaviorSanitizer
@@ -93,7 +93,8 @@ ctest --test-dir build-tsan --output-on-failure
 
 ### CMake 建置選項
 
-- `-DSAN4_GAME_DIR=/path/to/SAN4`：使用者自備之 DOS 版 `SAN4` 目錄路徑（除非啟用 `SAN4_CI_NO_GAME=ON`，否則將於 CMake 設定階段進行驗證）。
+- `-DSAN4_GAME_DIR=/path/to/SAN4`：使用者自備之 DOS 版 `SAN4` 目錄路徑（除非啟用 `SAN4_CI_NO_GAME=ON` 或已指定 `SAN4_EMBED_GAME_DIR`，否則將於 CMake 設定階段進行驗證）。
+- `-DSAN4_EMBED_GAME_DIR=/path/to/SAN4`：選用的個人單一執行檔內嵌模式（預設為空字串 `""`）。建置時會驗證全部 `43` 個原版 DOS `SAN4` 檔案，透過 `zlib` 壓縮輸出至建置目錄 `${CMAKE_BINARY_DIR}/generated/embedded_game_data.cpp`（絕不寫入原始碼目錄），並直接連結為記憶體內虛擬檔案系統（In-Memory VFS）封裝進 `san4-linux`／`san4.exe`，執行時完全無須外部 `SAN4` 資料夾。**使用此選項編譯之執行檔僅限個人使用，嚴禁散佈。**
 - `-DSAN4_CI_NO_GAME=ON`：在無本機遊戲檔案的情況下建置引擎、素材包產生器與合成測試套件（預設為 `OFF`）。
 - `-DSAN4_USE_CLANG=ON`：當未明確指定 `CMAKE_C_COMPILER`／`CMAKE_CXX_COMPILER` 時，自動探索配對的 `clang` 與 `clang++`（優先搜尋無版本號執行檔，再依序由 `clang-23` 往下搜尋至 `clang-15`；預設為 `OFF`）。
 - `-DSAN4_ENABLE_LTO=ON|OFF`：啟用連結時最佳化（Link-Time Optimization）。使用 Clang 且處於非 `Debug`、非 Sanitizer 組態時預設為 `ON`，其餘情況預設為 `OFF`（亦可搭配 GCC 明確設為 `ON` 以啟用 `-flto=auto`，或在 Clang 下明確設為 `OFF`）。若與 Sanitizer 旗標同時開啟，系統會自動發出警告並略過 LTO。
@@ -170,6 +171,29 @@ ctest --test-dir build-tsan --output-on-failure
   ├── README.md
   └── README.zh-TW.md
   ```
+
+### 個人單一執行檔獨立封裝建置（執行時無須外部 `SAN4` 遊戲資料夾）
+
+若您希望將自己合法擁有的原版遊戲檔案直接封裝成單一獨立的 `san4.exe`（Windows 11）或 `san4-linux`（Linux），方便在個人電腦上隨處複製並直接雙擊執行——完全不需要額外附帶 `SAN4` 原版資料夾——可在建置時傳入 `--embed-game-dir /path/to/SAN4`（或 `-DSAN4_EMBED_GAME_DIR=/path/to/SAN4`）：
+
+```bash
+# Windows 11 單一 san4.exe 獨立封裝建置（僅需複製 build-win64/san4.exe 即可直接雙擊遊玩）：
+./scripts/build_win64_static.sh --clang-lto --clean --package-zip --test \
+  --embed-game-dir /path/to/SAN4 -DSAN4_WARNINGS_AS_ERRORS=ON
+
+# Linux 可攜式靜態單一執行檔獨立封裝建置：
+./scripts/build_static.sh --clang-lto --clean --test \
+  --embed-game-dir /path/to/SAN4 -DSAN4_WARNINGS_AS_ERRORS=ON
+
+# 直接透過 CMake 建置：
+cmake -S . -B build-standalone -DCMAKE_BUILD_TYPE=Release \
+  -DSAN4_EMBED_GAME_DIR=/path/to/SAN4 -DSAN4_WARNINGS_AS_ERRORS=ON
+cmake --build build-standalone -j
+```
+
+- **運作機制**：於建置階段，`cmake/generate_embedded_vfs.py` 會嚴格驗證全部 `43` 個官方原版 DOS 檔案（自動排除 `SAVEDAT.S4` 與任何無關檔案），以 `zlib` 高壓縮率封裝（約 `3.6 MB`）產生不含任何主機路徑字串的 `${CMAKE_BINARY_DIR}/generated/embedded_game_data.cpp`，並僅連結至 `san4.exe`／`san4-linux`（`san4-hdpack-gen` 與 `san4_tests` 則維持不內嵌狀態）。
+- **遊戲存檔與新武將自動持久化**：啟動時於記憶體中一次性解壓縮並驗證 IEEE CRC-32（耗時 `< 5 ms`）。劇本進度存檔（`SAVEDAT.S4`）與自創登錄新武將資料（`NBDATA.S4`，首次寫入時自動以寫入時複製 Copy-on-Write 建立）會自動儲存至 Windows 的 `%LOCALAPPDATA%\SAN4\saves`（Linux 則為 `$XDG_DATA_HOME/san4/saves` 或 `~/.local/share/san4/saves`），並優先覆寫內嵌之出廠預設值。若在執行檔旁並排放置選用的 `hd_pack` 資料夾（或傳入 `--hd-pack`），仍會自動啟用 `4x` HD 高畫質渲染。
+- **僅限個人本機使用聲明**：使用 `--embed-game-dir`／`-DSAN4_EMBED_GAME_DIR` 編譯產出的執行檔已內嵌您的專有原版 DOS 遊戲檔案，僅供您個人本機合法自用，**嚴禁公開散佈或轉發**。
 
 ## 產生與使用完整 `4x` HD 高畫質素材包
 

@@ -88,6 +88,7 @@ class DosKernel {
     NulDevice,
     EmmDevice,
     DiskFile,
+    MemoryFile,
   };
 
   struct FileSlot {
@@ -100,6 +101,9 @@ class DosKernel {
     LastIo last_io = LastIo::None;
     std::uint16_t owner_psp = 0;
     bool writable = false;
+    const std::uint8_t* mem_data = nullptr;
+    std::size_t mem_size = 0;
+    std::size_t mem_pos = 0;
     std::filesystem::path host_path;
     std::fstream stream;
   };

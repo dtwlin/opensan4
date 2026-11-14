@@ -674,27 +674,8 @@ bool DosKernel::launch_executable(x86emu_t* emu, std::string_view dos_path,
     return true;
   }
 
-  auto host_exe = vfs_.resolve_for_read(dos_path);
-  if (!host_exe) {
-    return false;
-  }
-
-  std::ifstream ifs(*host_exe, std::ios::binary | std::ios::ate);
-  if (!ifs) {
-    return false;
-  }
-  const auto end_pos = ifs.tellg();
-  if (end_pos < 0) {
-    return false;
-  }
-  const auto fsize = static_cast<std::size_t>(end_pos);
-  if (fsize == 0u) {
-    return false;
-  }
-  ifs.seekg(0, std::ios::beg);
-  std::vector<std::uint8_t> exe_bytes(fsize);
-  if (!ifs.read(reinterpret_cast<char*>(exe_bytes.data()),
-                static_cast<std::streamsize>(fsize))) {
+  std::vector<std::uint8_t> exe_bytes;
+  if (!vfs_.read_all_bytes(dos_path, exe_bytes) || exe_bytes.empty()) {
     return false;
   }
   ++file_activity_;
@@ -1259,27 +1240,46 @@ void DosKernel::int21_open_or_create(x86emu_t* emu, bool create_mode,
     }
   }
 
-  if (!fs.is_open() || !resolved) {
-    if (is_save_file && want_write &&
-        (create_mode || resolved.has_value() ||
-         vfs_.resolve_for_read(path).has_value())) {
-      emu->x86.R_AX = 5u;  // Access denied
-    } else {
-      emu->x86.R_AX = 2u;  // File not found
-    }
-    set_cf(emu, true);
+  if (fs.is_open() && resolved) {
+    files_[slot] = FileSlot{};
+    files_[slot].kind = HandleKind::DiskFile;
+    files_[slot].last_io = FileSlot::LastIo::None;
+    files_[slot].owner_psp = current_psp_;
+    files_[slot].writable = opened_writable;
+    files_[slot].host_path = *resolved;
+    files_[slot].stream = std::move(fs);
+    ++file_activity_;
+    emu->x86.R_AX = static_cast<std::uint16_t>(slot);
+    set_cf(emu, false);
     return;
   }
 
-  files_[slot].kind = HandleKind::DiskFile;
-  files_[slot].last_io = FileSlot::LastIo::None;
-  files_[slot].owner_psp = current_psp_;
-  files_[slot].writable = opened_writable;
-  files_[slot].host_path = *resolved;
-  files_[slot].stream = std::move(fs);
-  ++file_activity_;
-  emu->x86.R_AX = static_cast<std::uint16_t>(slot);
-  set_cf(emu, false);
+  if (!create_mode && (!want_write || !is_save_file)) {
+    if (auto mem = vfs_.resolve_embedded_for_read(path)) {
+      files_[slot] = FileSlot{};
+      files_[slot].kind = HandleKind::MemoryFile;
+      files_[slot].last_io = FileSlot::LastIo::None;
+      files_[slot].owner_psp = current_psp_;
+      files_[slot].writable = false;
+      files_[slot].mem_data = mem->data();
+      files_[slot].mem_size = mem->size();
+      files_[slot].mem_pos = 0u;
+      ++file_activity_;
+      emu->x86.R_AX = static_cast<std::uint16_t>(slot);
+      set_cf(emu, false);
+      return;
+    }
+  }
+
+  if (is_save_file && want_write &&
+      (create_mode || resolved.has_value() ||
+       vfs_.resolve_for_read(path).has_value() ||
+       vfs_.resolve_embedded_for_read(path).has_value())) {
+    emu->x86.R_AX = 5u;  // Access denied
+  } else {
+    emu->x86.R_AX = 2u;  // File not found
+  }
+  set_cf(emu, true);
 }
 
 void DosKernel::int21_read_file(x86emu_t* emu) {
@@ -1290,7 +1290,9 @@ void DosKernel::int21_read_file(x86emu_t* emu) {
     set_cf(emu, true);
     return;
   }
-  if (files_[h].kind != HandleKind::DiskFile || count == 0u) {
+  if ((files_[h].kind != HandleKind::DiskFile &&
+       files_[h].kind != HandleKind::MemoryFile) ||
+      count == 0u) {
     emu->x86.R_AX = 0u;
     set_cf(emu, false);
     return;
@@ -1307,6 +1309,21 @@ void DosKernel::int21_read_file(x86emu_t* emu) {
       std::min<std::size_t>(count, ram_size_ - static_cast<std::size_t>(dst)));
 
   auto& f = files_[h];
+  if (f.kind == HandleKind::MemoryFile) {
+    const std::size_t avail =
+        (f.mem_pos < f.mem_size) ? (f.mem_size - f.mem_pos) : 0u;
+    const auto got =
+        static_cast<std::uint16_t>(std::min<std::size_t>(max_bytes, avail));
+    if (got > 0u) {
+      guest_write_block(dst, f.mem_data + f.mem_pos, got);
+      f.mem_pos += got;
+    }
+    f.last_io = FileSlot::LastIo::Read;
+    ++file_activity_;
+    emu->x86.R_AX = got;
+    set_cf(emu, false);
+    return;
+  }
   f.stream.clear();
   if (f.last_io == FileSlot::LastIo::Write) {
     const auto pos = f.stream.tellp();
@@ -1337,7 +1354,8 @@ void DosKernel::int21_write_file(x86emu_t* emu) {
     set_cf(emu, true);
     return;
   }
-  if (files_[h].kind != HandleKind::DiskFile) {
+  if (files_[h].kind != HandleKind::DiskFile &&
+      files_[h].kind != HandleKind::MemoryFile) {
     emu->x86.R_AX = count;
     set_cf(emu, false);
     return;
@@ -1401,7 +1419,8 @@ void DosKernel::int21_seek_file(x86emu_t* emu, std::uint8_t al) {
     set_cf(emu, true);
     return;
   }
-  if (files_[h].kind != HandleKind::DiskFile) {
+  if (files_[h].kind != HandleKind::DiskFile &&
+      files_[h].kind != HandleKind::MemoryFile) {
     emu->x86.R_DX = 0u;
     emu->x86.R_AX = 0u;
     set_cf(emu, false);
@@ -1409,13 +1428,36 @@ void DosKernel::int21_seek_file(x86emu_t* emu, std::uint8_t al) {
   }
   const auto offset = static_cast<std::int32_t>(
       (static_cast<std::uint32_t>(emu->x86.R_CX) << 16) | emu->x86.R_DX);
+  auto& f = files_[h];
+  if (f.kind == HandleKind::MemoryFile) {
+    std::int64_t base = 0;
+    if (al == 0u) {
+      base = 0;
+    } else if (al == 1u) {
+      base = static_cast<std::int64_t>(f.mem_pos);
+    } else if (al == 2u) {
+      base = static_cast<std::int64_t>(f.mem_size);
+    } else {
+      emu->x86.R_AX = 1u;
+      set_cf(emu, true);
+      return;
+    }
+    const std::int64_t target =
+        std::max<std::int64_t>(0, base + static_cast<std::int64_t>(offset));
+    f.mem_pos = static_cast<std::size_t>(target);
+    f.last_io = FileSlot::LastIo::None;
+    const auto new_pos = static_cast<std::uint32_t>(f.mem_pos);
+    emu->x86.R_DX = static_cast<std::uint16_t>((new_pos >> 16) & 0xFFFFu);
+    emu->x86.R_AX = static_cast<std::uint16_t>(new_pos & 0xFFFFu);
+    set_cf(emu, false);
+    return;
+  }
   std::ios_base::seekdir dir = std::ios::beg;
   if (al == 1u) {
     dir = std::ios::cur;
   } else if (al == 2u) {
     dir = std::ios::end;
   }
-  auto& f = files_[h];
   f.stream.clear();
   f.stream.seekg(offset, dir);
   const auto pos = f.stream.tellg();
@@ -1445,10 +1487,24 @@ void DosKernel::int21_ioctl(x86emu_t* emu, std::uint8_t al) {
       set_cf(emu, true);
       return;
     }
-    const std::uint16_t info =
-        (files_[h].kind == HandleKind::DiskFile) ? 0x0002u : 0x0080u;
+    const bool is_file = (files_[h].kind == HandleKind::DiskFile ||
+                          files_[h].kind == HandleKind::MemoryFile);
+    const std::uint16_t info = is_file ? 0x0002u : 0x0080u;
     emu->x86.R_DX = info;
     emu->x86.R_AX = info;
+    set_cf(emu, false);
+  } else if (al == 0x06u) {
+    if (h >= kMaxFiles || files_[h].kind == HandleKind::Unused) {
+      emu->x86.R_AX = 6u;
+      set_cf(emu, true);
+      return;
+    }
+    const std::uint8_t ready =
+        (files_[h].kind == HandleKind::MemoryFile &&
+         files_[h].mem_pos >= files_[h].mem_size)
+            ? 0x00u
+            : 0xFFu;
+    emu->x86.R_AL = ready;
     set_cf(emu, false);
   } else if (al == 0x07u) {
     emu->x86.R_AL = 0xFFu;
@@ -1769,6 +1825,15 @@ void DosKernel::handle_int21(x86emu_t* emu) {
       if (vfs_.resolve_for_read(path)) {
         emu->x86.R_CX = 0x0020u;
         set_cf(emu, false);
+      } else if (vfs_.resolve_embedded_for_read(path)) {
+        if (al == 0x01u) {
+          emu->x86.R_AX = 5u;
+          set_cf(emu, true);
+        } else {
+          const std::string upper = CaseInsensitiveVfs::dos_basename_upper(path);
+          emu->x86.R_CX = (upper == "NBDATA.S4") ? 0x0020u : 0x0001u;
+          set_cf(emu, false);
+        }
       } else {
         emu->x86.R_AX = 2u;
         set_cf(emu, true);

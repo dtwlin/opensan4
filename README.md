@@ -6,7 +6,7 @@
 
 ## Legal & Bring-Your-Own-Game (BYOG) Notice
 
-- **Zero Proprietary Assets Included**: This repository contains **only** clean-room engine and generator source code, build scripts, and synthetic unit tests. No Koei Co., Ltd. / Koei Tecmo Games Co., Ltd. executables (`.EXE`, `.COM`), scenarios/data (`.S4`), fonts (`.16P`), music, graphics, or save files are distributed in this repository or compiled into the `san4-linux` or `san4-hdpack-gen` binaries.
+- **Zero Proprietary Assets Included**: This repository contains **only** clean-room engine and generator source code, build scripts, and synthetic unit tests. No Koei Co., Ltd. / Koei Tecmo Games Co., Ltd. executables (`.EXE`, `.COM`), scenarios/data (`.S4`), fonts (`.16P`), music, graphics, or save files are distributed in this repository or compiled into the default `san4-linux`, `san4.exe`, or `san4-hdpack-gen` binaries. (If you opt in to `--embed-game-dir` / `-DSAN4_EMBED_GAME_DIR` locally to pack your own `43` DOS files into a personal single-file executable, that compiled `san4` binary contains your game assets and is strictly for your personal local use—**never redistribute it**.)
 - **Non-Affiliation**: *Romance of the Three Kingdoms* (`三國志`) is a trademark of Koei Tecmo Games Co., Ltd. This project is an independent interoperability and preservation runtime and is neither affiliated with nor endorsed by Koei Tecmo.
 - **Bring Your Own Game**: To build the default local configuration, generate an HD asset pack locally, and run the game, you must supply your own legitimately owned copy of the Traditional Chinese DOS `SAN4` directory (`43` immutable files, validated by size and SHA-256 at CMake configure time and runtime startup).
 
@@ -74,7 +74,7 @@ ctest --test-dir build --output-on-failure
 
 ### Public CI / Engine-Only Build (No Game Files Needed)
 
-Contributors and CI runners can compile `san4-linux`, `san4-hdpack-gen`, and `san4_tests` (`-Wall -Wextra -Wpedantic -Werror`) and run all `70` synthetic conformance, codec, upscaler, emulation, concurrency, CLI/host, LTO/SIMD, security, and hygiene test suites under AddressSanitizer + UndefinedBehaviorSanitizer, ThreadSanitizer (TSan), and Clang `llvm-cov` source-based code coverage without owning the game files:
+Contributors and CI runners can compile `san4-linux`, `san4-hdpack-gen`, and `san4_tests` (`-Wall -Wextra -Wpedantic -Werror`) and run all `71` synthetic conformance, codec, upscaler, emulation, concurrency, CLI/host, LTO/SIMD, security, and hygiene test suites under AddressSanitizer + UndefinedBehaviorSanitizer, ThreadSanitizer (TSan), and Clang `llvm-cov` source-based code coverage without owning the game files:
 
 ```bash
 # AddressSanitizer + UndefinedBehaviorSanitizer
@@ -93,7 +93,8 @@ ctest --test-dir build-tsan --output-on-failure
 
 ### CMake Options
 
-- `-DSAN4_GAME_DIR=/path/to/SAN4`: Path to user-supplied DOS `SAN4` directory (verified at configure time unless `SAN4_CI_NO_GAME=ON`).
+- `-DSAN4_GAME_DIR=/path/to/SAN4`: Path to user-supplied DOS `SAN4` directory (verified at configure time unless `SAN4_CI_NO_GAME=ON` or `SAN4_EMBED_GAME_DIR` is used).
+- `-DSAN4_EMBED_GAME_DIR=/path/to/SAN4`: Optional personal-use-only build mode (`""` by default). Verifies all `43` original DOS `SAN4` files, compresses them with `zlib` into `${CMAKE_BINARY_DIR}/generated/embedded_game_data.cpp` (never touching the source tree), and links an in-memory VFS directly into `san4-linux` / `san4.exe` so no external `SAN4` folder is needed at runtime. **Do not redistribute binaries built with this option.**
 - `-DSAN4_CI_NO_GAME=ON`: Build engine, generator, and synthetic test suite without local game files (`OFF` by default).
 - `-DSAN4_USE_CLANG=ON`: Auto-discover matching `clang` and `clang++` (unversioned first, then `clang-23` down to `clang-15`) when `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER` are not explicitly specified (`OFF` by default).
 - `-DSAN4_ENABLE_LTO=ON|OFF`: Enable Link-Time Optimization. Defaults to `ON` when building with Clang in non-`Debug`, non-sanitizer configurations, and `OFF` otherwise (can also be explicitly set `ON` with GCC for `-flto=auto`, or `OFF` on Clang). Automatically skipped with a warning if combined with sanitizer flags.
@@ -169,6 +170,29 @@ Cross-compile (or natively build under MSYS2 MinGW-w64) self-contained `x86_64` 
   ├── README.md
   └── README.zh-TW.md
   ```
+
+### Personal Single-File Standalone Build (No External `SAN4` Folder Needed)
+
+If you want a single self-contained `san4.exe` (Windows 11) or `san4-linux` (Linux) that you can copy anywhere on your own PC and run directly—without keeping a `SAN4` game folder beside it—pass `--embed-game-dir /path/to/SAN4` (or `-DSAN4_EMBED_GAME_DIR=/path/to/SAN4`):
+
+```bash
+# Windows 11 single-EXE standalone build (copy ONLY build-win64/san4.exe anywhere and double-click):
+./scripts/build_win64_static.sh --clang-lto --clean --package-zip --test \
+  --embed-game-dir /path/to/SAN4 -DSAN4_WARNINGS_AS_ERRORS=ON
+
+# Linux portable static single-binary standalone build:
+./scripts/build_static.sh --clang-lto --clean --test \
+  --embed-game-dir /path/to/SAN4 -DSAN4_WARNINGS_AS_ERRORS=ON
+
+# Direct CMake build:
+cmake -S . -B build-standalone -DCMAKE_BUILD_TYPE=Release \
+  -DSAN4_EMBED_GAME_DIR=/path/to/SAN4 -DSAN4_WARNINGS_AS_ERRORS=ON
+cmake --build build-standalone -j
+```
+
+- **How It Works**: At build time, `cmake/generate_embedded_vfs.py` verifies all `43` official DOS files (ignoring `SAVEDAT.S4` and any extra files), packs them with `zlib` (`~3.6 MB` compressed) into `${CMAKE_BINARY_DIR}/generated/embedded_game_data.cpp` with zero host path strings, and links them into `san4.exe` / `san4-linux` (`san4-hdpack-gen` and `san4_tests` remain unembedded).
+- **Persistent Saves & Custom Officers**: At startup, the archive decompresses once in memory (`< 5 ms`, IEEE CRC-32 verified). Campaign saves (`SAVEDAT.S4`) and custom officer edits (`NBDATA.S4`, copy-on-write materialized on first write) are saved automatically to `%LOCALAPPDATA%\SAN4\saves` on Windows (`$XDG_DATA_HOME/san4/saves` or `~/.local/share/san4/saves` on Linux), overriding the embedded factory defaults. Placing an optional `hd_pack` folder next to `san4.exe` / `san4-linux` (or passing `--hd-pack`) still enables `4x` HD graphics automatically.
+- **Personal Use Only**: Because a binary compiled with `--embed-game-dir` / `-DSAN4_EMBED_GAME_DIR` embeds your proprietary DOS game files, it is strictly for your own personal local use and **must not be redistributed**.
 
 ## Generating & Using the Complete `4x` HD Asset Pack
 

@@ -25,6 +25,7 @@ struct MachineConfig {
   std::filesystem::path save_dir;
   std::filesystem::path hd_pack_dir;
   std::filesystem::path dump_sprites_dir;
+  std::shared_ptr<const EmbeddedGameVfs> embedded_vfs;
   bool skip_intro = false;
   bool mouse_warp = true;
   int speed_multiplier = 1;  // 1, 2, or 4 (Tab overrides to 16 while held)

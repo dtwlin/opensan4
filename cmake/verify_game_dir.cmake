@@ -1,29 +1,13 @@
 # Clean-room Bring-Your-Own-Game (BYOG) CMake verification gate.
-# Verifies that the builder possesses the 43 immutable original SAN4 files
-# (matching exact byte lengths and SHA-256 digests, case-insensitively)
-# without embedding a single byte of game code or assets into compiled outputs.
+# Verifies that the builder possesses the 43 original SAN4 files
+# (matching exact byte lengths and SHA-256 digests, case-insensitively).
+# By default (SAN4_EMBED_GAME_DIR=""), zero bytes of game code or assets are
+# embedded into compiled outputs. When SAN4_EMBED_GAME_DIR is explicitly set by
+# the builder for a personal standalone executable, all 43 files in
+# SAN4_EMBED_GAME_DIR are verified before packing into the build directory.
 
-if(SAN4_CI_NO_GAME)
-  message(STATUS "[BYOG] SAN4_CI_NO_GAME=ON: Building clean-room engine & synthetic test suite without game files.")
-  return()
-endif()
-
-if(NOT SAN4_GAME_DIR AND DEFINED ENV{SAN4_GAME_DIR} AND NOT "$ENV{SAN4_GAME_DIR}" STREQUAL "")
-  set(SAN4_GAME_DIR "$ENV{SAN4_GAME_DIR}")
-endif()
-
-if(NOT SAN4_GAME_DIR)
-  message(FATAL_ERROR
-    "\n[BYOG] SAN4_GAME_DIR is required to build locally.\n"
-    "Supply your own legally owned copy of the Traditional Chinese DOS release:\n"
-    "  cmake -S . -B build -DSAN4_GAME_DIR=/path/to/SAN4\n"
-    "(For headless CI builds using synthetic tests only, pass -DSAN4_CI_NO_GAME=ON.)\n")
-endif()
-
-get_filename_component(SAN4_GAME_DIR_ABS "${SAN4_GAME_DIR}" ABSOLUTE)
-if(NOT IS_DIRECTORY "${SAN4_GAME_DIR_ABS}")
-  message(FATAL_ERROR "[BYOG] SAN4_GAME_DIR does not exist or is not a directory: ${SAN4_GAME_DIR_ABS}")
-endif()
+set(SAN4_EMBED_ACTIVE OFF)
+set(SAN4_EMBED_DEPENDS_FILES "")
 
 set(_SAN4_MANIFEST
   "EDMUSIC.S4|8706|8d5df99f4984564fc129c09e5d32f92057cc43662c06a2bb30f888aa6a050ec2"
@@ -71,44 +55,92 @@ set(_SAN4_MANIFEST
   "TOSHIMAP.S4|9514|d536cfd56db861325487d35185df3046204df9a9aa1fbbe1d5f52c0cd043b13e"
 )
 
-file(GLOB _DIR_ENTRIES RELATIVE "${SAN4_GAME_DIR_ABS}" "${SAN4_GAME_DIR_ABS}/*")
+macro(_san4_verify_dir_manifest _DIR_ABS _LABEL _OUT_MATCHED_LIST)
+  file(GLOB _DIR_ENTRIES RELATIVE "${_DIR_ABS}" "${_DIR_ABS}/*")
+  set(_MISSING "")
+  set(${_OUT_MATCHED_LIST} "")
+  foreach(_PARTS IN LISTS _SAN4_MANIFEST)
+    string(REGEX REPLACE "^([^|]+)\\|([^|]+)\\|([^|]+)$" "\\1" _EXP_NAME "${_PARTS}")
+    string(REGEX REPLACE "^([^|]+)\\|([^|]+)\\|([^|]+)$" "\\2" _EXP_SIZE "${_PARTS}")
+    string(REGEX REPLACE "^([^|]+)\\|([^|]+)\\|([^|]+)$" "\\3" _EXP_HASH "${_PARTS}")
 
-set(_MISSING "")
-foreach(_PARTS IN LISTS _SAN4_MANIFEST)
-  string(REGEX REPLACE "^([^|]+)\\|([^|]+)\\|([^|]+)$" "\\1" _EXP_NAME "${_PARTS}")
-  string(REGEX REPLACE "^([^|]+)\\|([^|]+)\\|([^|]+)$" "\\2" _EXP_SIZE "${_PARTS}")
-  string(REGEX REPLACE "^([^|]+)\\|([^|]+)\\|([^|]+)$" "\\3" _EXP_HASH "${_PARTS}")
+    set(_MATCHED_PATH "")
+    foreach(_ENT IN LISTS _DIR_ENTRIES)
+      string(TOUPPER "${_ENT}" _ENT_UP)
+      if("${_ENT_UP}" STREQUAL "${_EXP_NAME}")
+        set(_MATCHED_PATH "${_DIR_ABS}/${_ENT}")
+        break()
+      endif()
+    endforeach()
 
-  set(_MATCHED_PATH "")
-  foreach(_ENT IN LISTS _DIR_ENTRIES)
-    string(TOUPPER "${_ENT}" _ENT_UP)
-    if("${_ENT_UP}" STREQUAL "${_EXP_NAME}")
-      set(_MATCHED_PATH "${SAN4_GAME_DIR_ABS}/${_ENT}")
-      break()
+    if(NOT _MATCHED_PATH OR NOT EXISTS "${_MATCHED_PATH}")
+      list(APPEND _MISSING "  - Missing: ${_EXP_NAME}")
+    else()
+      file(SIZE "${_MATCHED_PATH}" _ACT_SIZE)
+      file(SHA256 "${_MATCHED_PATH}" _ACT_HASH)
+      # NBDATA.S4 (17,496 B) holds user-registered custom officers (New Busho Data)
+      # and is overwritten in-place by MAIN.EXE at fixed byte size.
+      if(NOT "${_ACT_SIZE}" STREQUAL "${_EXP_SIZE}")
+        list(APPEND _MISSING "  - Size mismatch on ${_EXP_NAME} (got ${_ACT_SIZE} B, expected ${_EXP_SIZE} B)")
+      elseif(NOT "${_EXP_NAME}" STREQUAL "NBDATA.S4" AND NOT "${_ACT_HASH}" STREQUAL "${_EXP_HASH}")
+        list(APPEND _MISSING "  - SHA-256 mismatch on ${_EXP_NAME} (got ${_ACT_HASH})")
+      else()
+        list(APPEND ${_OUT_MATCHED_LIST} "${_MATCHED_PATH}")
+      endif()
     endif()
   endforeach()
 
-  if(NOT _MATCHED_PATH OR NOT EXISTS "${_MATCHED_PATH}")
-    list(APPEND _MISSING "  - Missing: ${_EXP_NAME}")
-  else()
-    file(SIZE "${_MATCHED_PATH}" _ACT_SIZE)
-    file(SHA256 "${_MATCHED_PATH}" _ACT_HASH)
-    # NBDATA.S4 (17,496 B) holds user-registered custom officers (New Busho Data)
-    # and is overwritten in-place by MAIN.EXE at fixed byte size.
-    if(NOT "${_ACT_SIZE}" STREQUAL "${_EXP_SIZE}")
-      list(APPEND _MISSING "  - Size mismatch on ${_EXP_NAME} (got ${_ACT_SIZE} B, expected ${_EXP_SIZE} B)")
-    elseif(NOT "${_EXP_NAME}" STREQUAL "NBDATA.S4" AND NOT "${_ACT_HASH}" STREQUAL "${_EXP_HASH}")
-      list(APPEND _MISSING "  - SHA-256 mismatch on ${_EXP_NAME} (got ${_ACT_HASH})")
-    endif()
+  if(_MISSING)
+    string(JOIN "\n" _ERR_LINES ${_MISSING})
+    message(FATAL_ERROR
+      "\n[BYOG] ${_LABEL} verification failed in ${_DIR_ABS}:\n${_ERR_LINES}\n"
+      "Supply an unmodified copy of the Traditional Chinese DOS release of RTK4 (SAN4).\n")
   endif()
-endforeach()
+endmacro()
 
-if(_MISSING)
-  string(JOIN "\n" _ERR_LINES ${_MISSING})
-  message(FATAL_ERROR
-    "\n[BYOG] Game file verification failed in ${SAN4_GAME_DIR_ABS}:\n${_ERR_LINES}\n"
-    "Supply an unmodified copy of the Traditional Chinese DOS release of RTK4 (SAN4).\n")
+if(NOT "${SAN4_EMBED_GAME_DIR}" STREQUAL "")
+  if(SAN4_CI_NO_GAME)
+    message(FATAL_ERROR
+      "SAN4_EMBED_GAME_DIR cannot be combined with SAN4_CI_NO_GAME=ON.")
+  endif()
+  get_filename_component(SAN4_EMBED_GAME_DIR_ABS "${SAN4_EMBED_GAME_DIR}" ABSOLUTE)
+  if(NOT IS_DIRECTORY "${SAN4_EMBED_GAME_DIR_ABS}")
+    message(FATAL_ERROR
+      "[BYOG] SAN4_EMBED_GAME_DIR does not exist or is not a directory: ${SAN4_EMBED_GAME_DIR_ABS}")
+  endif()
+  _san4_verify_dir_manifest("${SAN4_EMBED_GAME_DIR_ABS}" "Embedded game file" SAN4_EMBED_DEPENDS_FILES)
+  set(SAN4_EMBED_ACTIVE ON)
+  message(STATUS
+    "[BYOG] STANDALONE EMBEDDED MODE (personal use only; do NOT redistribute compiled san4 binary): "
+    "verified all 43 game files in ${SAN4_EMBED_GAME_DIR_ABS}.")
+  if(NOT SAN4_GAME_DIR)
+    return()
+  endif()
 endif()
+
+if(SAN4_CI_NO_GAME)
+  message(STATUS "[BYOG] SAN4_CI_NO_GAME=ON: Building clean-room engine & synthetic test suite without game files.")
+  return()
+endif()
+
+if(NOT SAN4_GAME_DIR AND DEFINED ENV{SAN4_GAME_DIR} AND NOT "$ENV{SAN4_GAME_DIR}" STREQUAL "")
+  set(SAN4_GAME_DIR "$ENV{SAN4_GAME_DIR}")
+endif()
+
+if(NOT SAN4_GAME_DIR)
+  message(FATAL_ERROR
+    "\n[BYOG] SAN4_GAME_DIR is required to build locally.\n"
+    "Supply your own legally owned copy of the Traditional Chinese DOS release:\n"
+    "  cmake -S . -B build -DSAN4_GAME_DIR=/path/to/SAN4\n"
+    "(For headless CI builds using synthetic tests only, pass -DSAN4_CI_NO_GAME=ON.)\n")
+endif()
+
+get_filename_component(SAN4_GAME_DIR_ABS "${SAN4_GAME_DIR}" ABSOLUTE)
+if(NOT IS_DIRECTORY "${SAN4_GAME_DIR_ABS}")
+  message(FATAL_ERROR "[BYOG] SAN4_GAME_DIR does not exist or is not a directory: ${SAN4_GAME_DIR_ABS}")
+endif()
+
+_san4_verify_dir_manifest("${SAN4_GAME_DIR_ABS}" "Game file" _SAN4_EXTERNAL_MATCHED_FILES)
 
 file(WRITE "${CMAKE_BINARY_DIR}/san4_game_dir.txt" "${SAN4_GAME_DIR_ABS}\n")
 message(STATUS "[BYOG] Verified all 43 original game files in ${SAN4_GAME_DIR_ABS} (external only; zero bytes embedded).")

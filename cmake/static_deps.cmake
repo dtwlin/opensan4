@@ -84,6 +84,7 @@ set(SAN4_SDL2_LIBRARIES san4_static_sdl2)
 set(SAN4_X86EMU_INCLUDE_DIRS "${_san4_static_inc}")
 set(SAN4_X86EMU_LIBRARIES san4_static_x86emu)
 set(SAN4_PNG_LIBRARIES san4_static_png)
+set(SAN4_ZLIB_LIBRARIES san4_static_zlib)
 
 if(WIN32)
   set(SAN4_STATIC_LINK_FLAGS -pthread -static -static-libstdc++ -static-libgcc)

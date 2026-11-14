@@ -28,6 +28,7 @@ MachineConfig make_machine_config(const HostOptions& opts) {
   cfg.save_dir = opts.save_dir;
   cfg.hd_pack_dir = opts.hd_pack_dir;
   cfg.dump_sprites_dir = opts.dump_sprites_dir;
+  cfg.embedded_vfs = opts.embedded_vfs;
   cfg.skip_intro = opts.skip_intro;
   cfg.mouse_warp = opts.mouse_warp;
   cfg.speed_multiplier = opts.speed_multiplier;
@@ -1611,8 +1612,12 @@ int SdlHost::run() {
     return 1;
   }
   if (!machine_.boot("SAN486.COM")) {
-    std::cerr << "[san4] Failed to boot SAN486.COM from "
-              << util::path_to_utf8(opts_.game_dir) << "\n";
+    const std::string src_desc =
+        !opts_.game_dir.empty()
+            ? util::path_to_utf8(opts_.game_dir)
+            : (opts_.embedded_vfs ? std::string("<embedded-vfs>")
+                                  : std::string("<empty>"));
+    std::cerr << "[san4] Failed to boot SAN486.COM from " << src_desc << "\n";
     return 1;
   }
 

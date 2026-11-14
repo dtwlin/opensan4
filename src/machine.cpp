@@ -26,7 +26,7 @@ constexpr std::uint16_t kRomFont8x16Off = 0xB000u;
 
 X86Machine::X86Machine(const MachineConfig& cfg)
     : guest_ram_(kGuestRamBytes, 0u),
-      vfs_(cfg.game_dir, cfg.save_dir),
+      vfs_(cfg.game_dir, cfg.save_dir, cfg.embedded_vfs),
       dos_(vfs_, ems_) {
   set_base_speed_multiplier(cfg.speed_multiplier);
   set_deterministic(cfg.deterministic);
