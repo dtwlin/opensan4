@@ -38,6 +38,10 @@
 #include "frame_mailbox.h"
 #include "frame_profiler.h"
 #include "game_manifest.h"
+#include "gpu/gl_loader.h"
+#include "gpu/gl_renderer.h"
+#include "gpu/gl_shaders.h"
+#include "gpu/gpu_frame_mailbox.h"
 #include "grp600c_defs.h"
 #include "grp_census.h"
 #include "hd_gen/hd_art_upscaler.h"
@@ -58,6 +62,28 @@
 #include "util/thread_pool.h"
 #include "util/win32_platform.h"
 #include "video.h"
+
+#if defined(__SANITIZE_ADDRESS__)
+#define SAN4_TESTS_HAS_LSAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(leak_sanitizer)
+#define SAN4_TESTS_HAS_LSAN 1
+#endif
+#endif
+
+#if defined(SAN4_TESTS_HAS_LSAN) && !defined(_WIN32)
+// Third-party desktop libraries dlopen()'d by SDL2 when opening a live OpenGL
+// test window allocate one-time process singletons that remain across dlclose.
+// All OpenSan4 allocations remain strictly checked by LeakSanitizer.
+extern "C" const char* __lsan_default_suppressions() {
+  return "leak:libfontconfig.so\n"
+         "leak:libdbus-1.so\n"
+         "leak:libX11.so\n"
+         "leak:libglib-2.0.so\n"
+         "leak:libGLX_nvidia.so\n"
+         "leak:libnvidia-glcore.so\n";
+}
+#endif
 
 namespace {
 
@@ -6115,6 +6141,9 @@ struct SdlHostTestPeer {
   static SDL_AudioDeviceID audio_dev(const SdlHost& host) {
     return host.audio_dev_;
   }
+  static RenderBackendKind render_backend(const SdlHost& host) {
+    return host.render_backend_;
+  }
 };
 
 }  // namespace san4
@@ -10166,6 +10195,1027 @@ void test_embedded_game_vfs_memory_exec_cow_and_cli() {
   }
 }
 
+void test_gpu_render_policy_and_gl_loader() {
+  using san4::GlCapabilities;
+  using san4::RenderBackendKind;
+  using san4::RendererPreference;
+
+  CHECK(std::string_view(san4::render_backend_name(
+            RenderBackendKind::SdlRenderer)) == "sdl");
+  CHECK(std::string_view(san4::render_backend_name(
+            RenderBackendKind::OpenGL33)) == "opengl33");
+
+  CHECK(san4::should_probe_opengl(RendererPreference::Auto, false));
+  CHECK(san4::should_probe_opengl(RendererPreference::Gpu, false));
+  CHECK(!san4::should_probe_opengl(RendererPreference::Cpu, false));
+  CHECK(!san4::should_probe_opengl(RendererPreference::Auto, true));
+  CHECK(!san4::should_probe_opengl(RendererPreference::Gpu, true));
+
+  CHECK(!san4::is_software_gl_renderer("NVIDIA GeForce RTX 4070/PCIe/SSE2"));
+  CHECK(!san4::is_software_gl_renderer("Quadro P1000/PCIe/SSE2"));
+  CHECK(!san4::is_software_gl_renderer("AMD Radeon RX 7800 XT (radeonsi)"));
+  CHECK(!san4::is_software_gl_renderer("Mesa Intel(R) Graphics (ADL GT2)"));
+
+  CHECK(san4::is_software_gl_renderer("llvmpipe (LLVM 19.1.7, 256 bits)"));
+  CHECK(san4::is_software_gl_renderer("Gallium 0.4 on softpipe"));
+  CHECK(san4::is_software_gl_renderer("Mesa DRI swrast"));
+  CHECK(san4::is_software_gl_renderer("Mesa lavapipe"));
+  CHECK(san4::is_software_gl_renderer("SVGA3D; build: RELEASE; LLVM;"));
+  CHECK(san4::is_software_gl_renderer("GDI Generic"));
+  CHECK(san4::is_software_gl_renderer("Microsoft Basic Render Driver"));
+  CHECK(san4::is_software_gl_renderer("D3D12 (Microsoft Basic Render Driver)"));
+  CHECK(san4::is_software_gl_renderer("ANGLE (Microsoft, D3D11 WARP)"));
+
+  const GlCapabilities hw_caps{
+      .context_ok = true,
+      .procs_ok = true,
+      .major_version = 4,
+      .minor_version = 6,
+      .max_texture_size = 16384,
+      .gl_renderer = "NVIDIA Corporation GP107GL",
+  };
+  CHECK(san4::select_render_backend(RendererPreference::Auto, hw_caps) ==
+        RenderBackendKind::OpenGL33);
+  CHECK(san4::select_render_backend(RendererPreference::Gpu, hw_caps) ==
+        RenderBackendKind::OpenGL33);
+  CHECK(san4::select_render_backend(RendererPreference::Cpu, hw_caps) ==
+        RenderBackendKind::SdlRenderer);
+
+  GlCapabilities bad = hw_caps;
+  bad.context_ok = false;
+  CHECK(san4::select_render_backend(RendererPreference::Auto, bad) ==
+        RenderBackendKind::SdlRenderer);
+
+  bad = hw_caps;
+  bad.procs_ok = false;
+  CHECK(san4::select_render_backend(RendererPreference::Gpu, bad) ==
+        RenderBackendKind::SdlRenderer);
+
+  bad = hw_caps;
+  bad.major_version = 3;
+  bad.minor_version = 2;
+  CHECK(san4::select_render_backend(RendererPreference::Auto, bad) ==
+        RenderBackendKind::SdlRenderer);
+  bad.minor_version = 3;
+  CHECK(san4::select_render_backend(RendererPreference::Auto, bad) ==
+        RenderBackendKind::OpenGL33);
+
+  bad = hw_caps;
+  bad.max_texture_size = 2048;
+  CHECK(san4::select_render_backend(RendererPreference::Auto, bad) ==
+        RenderBackendKind::SdlRenderer);
+  bad.max_texture_size = san4::kMinOpenGlTextureSize;
+  CHECK(san4::select_render_backend(RendererPreference::Auto, bad) ==
+        RenderBackendKind::OpenGL33);
+
+  GlCapabilities sw_gl = hw_caps;
+  sw_gl.gl_renderer = "llvmpipe (LLVM 19.1.7, 256 bits)";
+  CHECK(san4::select_render_backend(RendererPreference::Auto, sw_gl) ==
+        RenderBackendKind::SdlRenderer);
+  // Explicit --renderer=gpu permits OpenGL 3.3 even on software GL rasterizers.
+  CHECK(san4::select_render_backend(RendererPreference::Gpu, sw_gl) ==
+        RenderBackendKind::OpenGL33);
+
+  int maj = 0;
+  int min = 0;
+  CHECK(san4::gpu::parse_gl_version("4.6.0 NVIDIA 550.163.01", maj, min) &&
+        maj == 4 && min == 6);
+  CHECK(san4::gpu::parse_gl_version("3.3 (Core Profile) Mesa 24.2.8", maj, min) &&
+        maj == 3 && min == 3);
+  CHECK(san4::gpu::parse_gl_version("OpenGL ES 3.2 Mesa 24.0", maj, min) &&
+        maj == 3 && min == 2);
+  CHECK(!san4::gpu::parse_gl_version("", maj, min));
+  CHECK(!san4::gpu::parse_gl_version("no digits here", maj, min));
+  CHECK(!san4::gpu::parse_gl_version("3.", maj, min));
+
+  san4::gpu::GlProcs procs{};
+  std::string missing;
+  CHECK(!procs.load(nullptr, &missing));
+  CHECK(missing == "<null-loader>");
+
+  CHECK(!procs.load(
+      +[](const char* name) -> void* {
+        if (std::string_view(name) == "glTexSubImage2D") {
+          return nullptr;
+        }
+        static int dummy_sym = 0;
+        return &dummy_sym;
+      },
+      &missing));
+  CHECK(missing == "glTexSubImage2D");
+
+  CHECK(procs.load(
+      +[](const char*) -> void* {
+        static int dummy_sym = 0;
+        return &dummy_sym;
+      },
+      &missing));
+  CHECK(missing.empty());
+
+  // PixelUpscaler::set_canvas_enabled(false) skips allocating multi-MB CPU
+  // output buffers during GPU mode switches while preserving safety allocation
+  // if upscale_full_buffer is explicitly called.
+  san4::PixelUpscaler up(2);
+  up.set_canvas_enabled(false);
+  CHECK(!up.canvas_enabled());
+  up.set_mode(san4::UpscaleMode::Xbr4x);
+  CHECK(up.output_width() == 3200 && up.output_height() == 2400);
+  CHECK(up.output_argb().empty());
+  up.set_canvas_enabled(true);
+  CHECK(up.canvas_enabled());
+  CHECK(up.output_argb().size() == 3200u * 2400u);
+}
+
+void test_gpu_frame_mailbox_dirty_tiles_and_concurrency() {
+  san4::ThreadPool pool(4);
+  san4::GpuFrameMailbox mb;
+  mb.set_thread_pool(&pool);
+
+  std::vector<std::uint8_t> vram(800u * 600u, 3u);
+  std::array<std::uint64_t, san4::VesaPlanarVideo::kTileCount> vram_gen{};
+  vram_gen.fill(1u);
+  std::array<std::uint32_t, 16> pal{};
+  for (int i = 0; i < 16; ++i) {
+    pal[static_cast<std::size_t>(i)] =
+        0xFF000000u | static_cast<std::uint32_t>(i * 0x111111u);
+  }
+  std::array<std::uint8_t, san4::VesaPlanarVideo::kTileCount> glyph{};
+  std::array<std::uint64_t, san4::VesaPlanarVideo::kTileCount> glyph_gen{};
+
+  san4::GpuVideoInput vid_in{
+      .src_w = 800,
+      .src_h = 600,
+      .mode = san4::UpscaleMode::Sharp2x,
+      .vram = vram.data(),
+      .vram_tile_gen = vram_gen.data(),
+      .palette_argb = &pal,
+      .palette_gen = 1u,
+      .glyph_tiles = glyph.data(),
+      .glyph_tile_gen = glyph_gen.data(),
+      .glyph_gen = 0u,
+  };
+  san4::GpuHdInput hd_in{};
+  san4::HostStatus st{};
+  san4::FrameProfileRow prof{};
+
+  // 1) Initial publish without HD allocates zero HD buffers!
+  mb.publish(vid_in, hd_in, true, st, prof);
+  const san4::GpuFrameMailbox::Slot* s1 = mb.acquire();
+  CHECK(s1 != nullptr);
+  CHECK(s1->gen == 1u && !s1->hd_active);
+  CHECK(s1->hd_canvas_argb.empty() && s1->hd_lut_idx.empty());
+  CHECK(s1->out_w == 1600 && s1->out_h == 1200 && s1->scale == 2);
+  const std::uint64_t gen1 = s1->gen;
+
+  // 2) Two skipped partial updates (tiles (2, 3) and (10, 5)) accumulate cleanly.
+  vram[3u * 16u * 800u + 2u * 16u] = 7u;
+  vram_gen[3u * 50u + 2u] = 2u;
+  mb.publish(vid_in, hd_in, false, st, prof);  // gen 2 (not acquired)
+
+  vram[5u * 16u * 800u + 10u * 16u] = 9u;
+  vram_gen[5u * 50u + 10u] = 3u;
+  mb.publish(vid_in, hd_in, false, st, prof);  // gen 3 (acquired)
+
+  const san4::GpuFrameMailbox::Slot* s3 = mb.acquire();
+  CHECK(s3 != nullptr && s3->gen == 3u);
+  CHECK(s3->vram[3u * 16u * 800u + 2u * 16u] == 7u);
+  CHECK(s3->vram[5u * 16u * 800u + 10u * 16u] == 9u);
+
+  std::vector<san4::UpscaleDirtyRect> rects;
+  const std::uint64_t px_changed = san4::GpuFrameMailbox::changed_tile_rects(
+      s3->vram_tile_gen, gen1, 50, 38, 16, 800, 600, 0, rects);
+  CHECK(px_changed == 2u * 16u * 16u);
+  const std::uint64_t gen3 = s3->gen;
+
+  // 3) Pure palette crossfade tick: zero VRAM tiles dirty, full_recompose_gen bumps!
+  pal[3] = 0xFFABCDEFu;
+  vid_in.palette_gen = 2u;
+  mb.publish(vid_in, hd_in, false, st, prof);
+  const san4::GpuFrameMailbox::Slot* s4 = mb.acquire();
+  CHECK(s4 != nullptr && s4->gen == 4u);
+  CHECK(san4::GpuFrameMailbox::changed_tile_rects(
+            s4->vram_tile_gen, gen3, 50, 38, 16, 800, 600, 0, rects) == 0u);
+  CHECK(s4->palette_gen == 4u && s4->full_recompose_gen == 4u);
+
+  // 4) HD activation -> deactivation -> reactivation bumps hd_epoch!
+  std::vector<std::uint32_t> hd_px(3200u * 2400u, 0x80224466u);
+  std::array<std::uint64_t, san4::VesaPlanarVideo::kTileCount> hd_gen{};
+  hd_gen.fill(1u);
+  std::vector<std::uint16_t> lut_idx(800u * 600u, 1u);
+  std::array<std::uint64_t, san4::VesaPlanarVideo::kTileCount> lut_idx_gen{};
+  lut_idx_gen.fill(1u);
+  std::array<int, 256> slot_map{};
+  slot_map.fill(-1);
+
+  hd_in.active = true;
+  hd_in.canvas_argb = hd_px.data();
+  hd_in.canvas_tile_gen = hd_gen.data();
+  hd_in.lut_idx_map = lut_idx.data();
+  hd_in.lut_idx_tile_gen = lut_idx_gen.data();
+  hd_in.lut_slot_map = slot_map.data();
+  hd_in.luts_gen = 1u;
+
+  mb.publish(vid_in, hd_in, false, st, prof);
+  const san4::GpuFrameMailbox::Slot* s5 = mb.acquire();
+  CHECK(s5 != nullptr && s5->hd_active);
+  CHECK(s5->hd_canvas_argb.size() == 3200u * 2400u);
+  const std::uint64_t epoch1 = s5->hd_epoch;
+
+  hd_in.active = false;
+  mb.publish(vid_in, hd_in, false, st, prof);
+  const san4::GpuFrameMailbox::Slot* s6 = mb.acquire();
+  CHECK(s6 != nullptr && !s6->hd_active);
+
+  hd_in.active = true;
+  mb.publish(vid_in, hd_in, false, st, prof);
+  const san4::GpuFrameMailbox::Slot* s7 = mb.acquire();
+  CHECK(s7 != nullptr && s7->hd_active && s7->hd_epoch > epoch1);
+
+  // 5) Concurrent EmuThread + GpuFrameMailbox stress under TSan/ASan!
+  {
+    san4::X86Machine m;
+    static constexpr std::uint8_t kLoopCom[] = {
+        0xB8, 0x02, 0x4F, 0xBB, 0x02, 0x01, 0xCD, 0x10,
+        0xB8, 0x00, 0xA0, 0x8E, 0xC0,
+        0x31, 0xFF,                    // xor di, di
+        0xFE, 0xC0,                    // loop: inc al
+        0x26, 0x88, 0x05,              // mov es:[di], al
+        0x81, 0xC7, 0x11, 0x00,        // add di, 17
+        0x81, 0xE7, 0xFF, 0x3F,        // and di, 0x3FFF
+        0xB8, 0x03, 0x00, 0xCD, 0x33,  // mouse poll yield
+        0xEB, 0xEE,                    // jmp loop
+    };
+    m.load_synthetic_code(0x2000u, 0x0100u, kLoopCom);
+    san4::PixelUpscaler up(2);
+    up.set_canvas_enabled(false);
+    san4::EmuSession sess(m, up);
+    san4::GpuFrameMailbox gmb;
+    gmb.set_thread_pool(&pool);
+    san4::HostCommandQueue cmds;
+    san4::EmuThread emu;
+    emu.start(sess, gmb, cmds,
+              san4::EmuSession::LoopOptions{
+                  .guest_budget_sec = 0.002,
+                  .drain_audio = true,
+                  .profiling = true,
+              });
+
+    int acquired_count = 0;
+    std::uint64_t uploaded_vram_gen = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    while (acquired_count < 8 && std::chrono::steady_clock::now() < deadline) {
+      if (const auto* slot = gmb.acquire()) {
+        ++acquired_count;
+        san4::GpuFrameMailbox::changed_tile_rects(
+            slot->vram_tile_gen, uploaded_vram_gen, 50, 38, 16, slot->src_w,
+            slot->src_h, 0, rects);
+        uploaded_vram_gen = slot->gen;
+        if (acquired_count == 2) {
+          cmds.push(san4::HostCmd::simple(san4::HostCmdType::CycleScale));
+        } else if (acquired_count == 4) {
+          cmds.push(san4::HostCmd::simple(san4::HostCmdType::MarkAllDirty));
+        }
+      } else {
+        gmb.wait_for_fresh_until(std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(5));
+      }
+    }
+    cmds.push(san4::HostCmd::simple(san4::HostCmdType::Quit));
+    emu.stop();
+    CHECK(acquired_count >= 4);
+  }
+}
+
+void test_hd_pack_gpu_metadata_and_lut_stability() {
+  auto encode_planar_16x16 = [](const std::array<std::uint8_t, 256>& vga_slots) {
+    std::vector<std::uint8_t> out(128u, 0u);
+    for (int y = 0; y < 16; ++y) {
+      for (int col = 0; col < 2; ++col) {
+        std::uint8_t pb[4]{0u, 0u, 0u, 0u};
+        for (int bit = 0; bit < 8; ++bit) {
+          const int x = col * 8 + bit;
+          const std::uint8_t gc =
+              san4::kGrpSlotMap[vga_slots[static_cast<std::size_t>(y * 16 + x)] &
+                                0x0Fu];
+          const unsigned sh = static_cast<unsigned>(7 - bit);
+          for (int p = 0; p < 4; ++p) {
+            pb[p] |= static_cast<std::uint8_t>(((gc >> p) & 1u) << sh);
+          }
+        }
+        for (int p = 0; p < 4; ++p) {
+          out[static_cast<std::size_t>((y * 2 + col) * 4 + p)] = pb[p];
+        }
+      }
+    }
+    return out;
+  };
+  auto format_pal_csv = [](const std::array<std::uint32_t, 16>& pal) {
+    std::string s;
+    char buf[16];
+    for (int i = 0; i < 16; ++i) {
+      if (i > 0) s.push_back(',');
+      std::snprintf(buf, sizeof(buf), "%06X",
+                    pal[static_cast<std::size_t>(i)] & 0x00FFFFFFu);
+      s += buf;
+    }
+    return s;
+  };
+  auto apply_scene_palette = [](san4::VesaPlanarVideo& vid,
+                                const std::array<std::uint32_t, 16>& pal) {
+    std::array<std::uint8_t, 48> brg{};
+    for (int gc = 0; gc < 16; ++gc) {
+      const std::uint32_t c = pal[san4::kGrpSlotMap[gc]];
+      brg[static_cast<std::size_t>(gc * 3 + 0)] =
+          static_cast<std::uint8_t>((c & 0xFFu) / 0x11u);
+      brg[static_cast<std::size_t>(gc * 3 + 1)] =
+          static_cast<std::uint8_t>(((c >> 16) & 0xFFu) / 0x11u);
+      brg[static_cast<std::size_t>(gc * 3 + 2)] =
+          static_cast<std::uint8_t>(((c >> 8) & 0xFFu) / 0x11u);
+    }
+    vid.begin_smooth_fade(0u, 16u, brg.data(), brg.data(),
+                          san4::kGrpSlotMap.data(), 0.01);
+    vid.finish_fade_immediately();
+    vid.latch_frame();
+  };
+
+  ScopedTempDir tmp;
+  const auto pack_dir = tmp.path() / "gpu_meta_pack";
+  std::filesystem::create_directories(pack_dir / "tiles");
+
+  const auto master_pal = san4::codecs::default_san4_master_palette();
+  std::array<std::uint8_t, 256> slots_a{};
+  slots_a.fill(san4::kGrpSlotMap[2]);
+  slots_a[0] = san4::kGrpSlotMap[9];
+  const std::uint64_t hash_a =
+      san4::HdPackManager::hash_sprite_4bit(16, 16, slots_a.data());
+
+  std::array<std::uint8_t, 256> slots_b{};
+  slots_b.fill(san4::kGrpSlotMap[2]);
+  slots_b[0] = san4::kGrpSlotMap[9];
+  slots_b[1] = san4::kGrpSlotMap[12];  // wider used_mask, same ref_pal!
+  const std::uint64_t hash_b =
+      san4::HdPackManager::hash_sprite_4bit(16, 16, slots_b.data());
+
+  std::array<std::uint8_t, 256> slots_loose{};
+  slots_loose.fill(san4::kGrpSlotMap[4]);
+  slots_loose[3] = san4::kGrpSlotMap[14];
+  const std::uint64_t hash_loose =
+      san4::HdPackManager::hash_sprite_4bit(16, 16, slots_loose.data());
+
+  {
+    const std::vector<std::uint32_t> px_a(64u * 64u, 0xFF228844u);
+    const std::vector<std::uint32_t> px_b(64u * 64u, 0xCC4466AAu);
+    const std::vector<std::uint32_t> px_l(64u * 64u, 0xFFEEDD33u);
+    CHECK(san4::HdPackManager::save_argb_png(
+        pack_dir / "tiles" / "a.png", 64, 64, px_a.data()));
+    CHECK(san4::HdPackManager::save_argb_png(
+        pack_dir / "tiles" / "b.png", 64, 64, px_b.data()));
+    char lbuf[64];
+    std::snprintf(lbuf, sizeof(lbuf), "img_16x16_%016llx.png",
+                  static_cast<unsigned long long>(hash_loose));
+    CHECK(san4::HdPackManager::save_argb_png(pack_dir / lbuf, 64, 64,
+                                             px_l.data()));
+
+    std::ofstream mf(pack_dir / "hd_manifest.tsv", std::ios::binary);
+    char hbuf[32];
+    std::snprintf(hbuf, sizeof(hbuf), "%016llx",
+                  static_cast<unsigned long long>(hash_a));
+    mf << hbuf << "\t16\t16\t2\ttiles/a.png\t" << format_pal_csv(master_pal)
+       << "\n";
+    std::snprintf(hbuf, sizeof(hbuf), "%016llx",
+                  static_cast<unsigned long long>(hash_b));
+    mf << hbuf << "\t16\t16\t2\ttiles/b.png\t" << format_pal_csv(master_pal)
+       << "\n";
+  }
+
+  san4::VesaPlanarVideo vid;
+  vid.reset_mode(0x0102u);
+  apply_scene_palette(vid, master_pal);
+  vid.clear_hd_occlude_bits();
+
+  san4::HdPackManager hd;
+  hd.set_pack_dir(pack_dir);
+  const san4::GrpClipRect full_clip{0, 0, 799, 599};
+  hd.on_planar_blit_source(0, 0, 16, 16, 4, 0u, 0u, 0u, 0u, full_clip,
+                           encode_planar_16x16(slots_a), vid);
+  hd.on_planar_blit_source(32, 0, 16, 16, 4, 0u, 0u, 0u, 0u, full_clip,
+                           encode_planar_16x16(slots_loose), vid);
+  hd.prepare_frame(vid);
+
+  san4::GpuHdInput gpu_hd{};
+  hd.prepare_gpu_composite_state(vid, true, gpu_hd);
+  CHECK(gpu_hd.active);
+  // Loose override uses permanent ungraded slot 1 -> lut_slot_map[0] == -1.
+  CHECK(gpu_hd.lut_idx_map[32] == 1u);
+  CHECK(gpu_hd.lut_slot_map[0] == -1);
+  // Graded tile A gets slot >= 2; live palette equals ref_pal -> identity (-1).
+  const std::uint16_t slot_a = gpu_hd.lut_idx_map[0];
+  CHECK(slot_a >= 2u);
+  CHECK(gpu_hd.lut_slot_map[slot_a - 1u] == -1);
+  const std::uint64_t tile0_idx_gen_before = gpu_hd.lut_idx_tile_gen[0];
+
+  // Shift live palette (e.g. winter / battle tint): lut_idx_map stays stable
+  // (zero 800x600 index-map tiles re-uploaded!), while lut_slot_map resolves
+  // to a real 17x17x17 3D LUT!
+  auto shifted_pal = master_pal;
+  for (int i = 0; i < 16; ++i) {
+    shifted_pal[static_cast<std::size_t>(i)] =
+        0xFF000000u |
+        ((shifted_pal[static_cast<std::size_t>(i)] >> 1) & 0x007F7F7Fu);
+  }
+  apply_scene_palette(vid, shifted_pal);
+  hd.prepare_frame(vid);
+  hd.prepare_gpu_composite_state(vid, false, gpu_hd);
+  CHECK(gpu_hd.lut_idx_tile_gen[0] == tile0_idx_gen_before);
+  CHECK(gpu_hd.lut_slot_map[slot_a - 1u] >= 0);
+  CHECK(!gpu_hd.luts.empty());
+
+  // Partially overwrite half of region A with translucent sprite B (wider
+  // used_mask) or new region: verify lut_idx_map updates cleanly!
+  hd.on_planar_blit_source(8, 0, 16, 16, 4, 0u, 0u, 0u, 0u, full_clip,
+                           encode_planar_16x16(slots_b), vid);
+  hd.prepare_frame(vid);
+  hd.prepare_gpu_composite_state(vid, false, gpu_hd);
+  CHECK(gpu_hd.lut_idx_map[8] >= 2u);
+
+  // clear_overlays() transitions gpu_hd.active back to false cleanly via EmuSession!
+  san4::X86Machine m;
+  san4::PixelUpscaler up(2);
+  up.set_canvas_enabled(false);
+  san4::EmuSession sess(m, up);
+  san4::GpuFrameMailbox gmb;
+  m.video().reset_mode(0x0102u);
+  m.hd_pack().set_pack_dir(pack_dir);
+  m.hd_pack().on_planar_blit_source(0, 0, 16, 16, 4, 0u, 0u, 0u, 0u, full_clip,
+                                    encode_planar_16x16(slots_a), m.video());
+  m.video().latch_frame();
+  bool force_full = true;
+  sess.produce_gpu_frame(force_full, gmb, nullptr);
+  const auto* active_slot = gmb.acquire();
+  CHECK(active_slot != nullptr && active_slot->hd_active);
+
+  m.hd_pack().clear_overlays();
+  m.video().latch_frame();
+  sess.produce_gpu_frame(force_full, gmb, nullptr);
+  const auto* cleared_slot = gmb.acquire();
+  CHECK(cleared_slot != nullptr && !cleared_slot->hd_active);
+}
+
+void test_opengl33_gpu_vs_cpu_pixel_parity() {
+  // 1) GLSL 330 Core shader source invariants (always checked even headless).
+  const std::string_view vs = san4::gpu::fullscreen_vertex_shader_src();
+  const std::string_view fs_comp =
+      san4::gpu::upscale_composite_fragment_shader_src();
+  const std::string_view fs_pres = san4::gpu::present_fragment_shader_src();
+  CHECK(vs.starts_with("#version 330 core"));
+  CHECK(fs_comp.starts_with("#version 330 core"));
+  CHECK(fs_pres.starts_with("#version 330 core"));
+
+#if defined(__SANITIZE_THREAD__)
+  std::cout << "[san4_tests] Skipping live OpenGL 3.3 driver context under TSan\n";
+  return;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+  std::cout << "[san4_tests] Skipping live OpenGL 3.3 driver context under TSan\n";
+  return;
+#endif
+#endif
+
+  const char* vid_env = std::getenv("SDL_VIDEODRIVER");
+  if (vid_env != nullptr && std::string_view(vid_env) == "dummy") {
+    std::cout << "[san4_tests] Skipping live OpenGL 3.3 parity (SDL_VIDEODRIVER=dummy)\n";
+    return;
+  }
+
+  struct GlTestContext {
+    SDL_Window* win = nullptr;
+    SDL_GLContext ctx = nullptr;
+    san4::gpu::GlProcs procs{};
+    san4::gpu::GlRenderer renderer{};
+    std::string renderer_name;
+    bool video_inited = false;
+
+    ~GlTestContext() {
+      if (win != nullptr && ctx != nullptr) {
+        SDL_GL_MakeCurrent(win, ctx);
+      }
+      renderer.shutdown();
+      if (ctx != nullptr) {
+        SDL_GL_DeleteContext(ctx);
+      }
+      if (win != nullptr) {
+        SDL_DestroyWindow(win);
+      }
+      SDL_GL_ResetAttributes();
+      if (video_inited) {
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        SDL_Quit();
+      }
+    }
+  } gl_test;
+
+  SDL_SetMainReady();
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    std::cout << "[san4_tests] Skipping live OpenGL 3.3 parity (no video display: "
+              << SDL_GetError() << ")\n";
+    return;
+  }
+  gl_test.video_inited = true;
+
+  SDL_GL_ResetAttributes();
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+  SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+  SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+
+  gl_test.win = SDL_CreateWindow(
+      "san4_gl_parity", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 64,
+      64, SDL_WINDOW_HIDDEN | SDL_WINDOW_OPENGL);
+  if (gl_test.win == nullptr) {
+    std::cout << "[san4_tests] Skipping live OpenGL 3.3 parity (no GL window: "
+              << SDL_GetError() << ")\n";
+    return;
+  }
+  gl_test.ctx = SDL_GL_CreateContext(gl_test.win);
+  if (gl_test.ctx == nullptr) {
+    std::cout << "[san4_tests] Skipping live OpenGL 3.3 parity (no GL 3.3 ctx: "
+              << SDL_GetError() << ")\n";
+    return;
+  }
+  SDL_GL_MakeCurrent(gl_test.win, gl_test.ctx);
+
+  std::string missing_sym;
+  CHECK(gl_test.procs.load(
+      +[](const char* name) -> void* { return SDL_GL_GetProcAddress(name); },
+      &missing_sym));
+  if (const auto* r = gl_test.procs.GetString(san4::gpu::kGlRenderer)) {
+    gl_test.renderer_name = reinterpret_cast<const char*>(r);
+  }
+  std::string init_err;
+  if (!gl_test.renderer.init(gl_test.procs, &init_err)) {
+    std::cerr << "[FAIL] GlRenderer::init failed on '" << gl_test.renderer_name
+              << "': " << init_err << "\n";
+    ++g_failures;
+    return;
+  }
+  std::cout << "[san4_tests] Running live OpenGL 3.3 GPU-vs-CPU parity on: "
+            << gl_test.renderer_name << "\n";
+
+  // Helper to populate identical guest VRAM/palette/glyph/HD actions on paired
+  // CPU and GPU machines and assert 0 pixel differences!
+  auto encode_planar_16x16 = [](const std::array<std::uint8_t, 256>& vga_slots) {
+    std::vector<std::uint8_t> out(128u, 0u);
+    for (int y = 0; y < 16; ++y) {
+      for (int col = 0; col < 2; ++col) {
+        std::uint8_t pb[4]{0u, 0u, 0u, 0u};
+        for (int bit = 0; bit < 8; ++bit) {
+          const int x = col * 8 + bit;
+          const std::uint8_t gc =
+              san4::kGrpSlotMap[vga_slots[static_cast<std::size_t>(y * 16 + x)] &
+                                0x0Fu];
+          const unsigned sh = static_cast<unsigned>(7 - bit);
+          for (int p = 0; p < 4; ++p) {
+            pb[p] |= static_cast<std::uint8_t>(((gc >> p) & 1u) << sh);
+          }
+        }
+        for (int p = 0; p < 4; ++p) {
+          out[static_cast<std::size_t>((y * 2 + col) * 4 + p)] = pb[p];
+        }
+      }
+    }
+    return out;
+  };
+  auto set_pixel_planar = [](san4::VesaPlanarVideo& v, int x, int y,
+                             std::uint8_t slot) {
+    const int bpl = v.active_bytes_per_line();
+    const auto off = static_cast<std::uint32_t>(y * bpl + (x >> 3));
+    const auto bit = static_cast<std::uint8_t>(0x80u >> (x & 7));
+    v.port_out8(0x03CEu, 0x05u);
+    v.port_out8(0x03CFu, 0x02u);  // Write Mode 2
+    v.port_out8(0x03CEu, 0x08u);
+    v.port_out8(0x03CFu, bit);
+    v.port_out8(0x03C4u, 0x02u);
+    v.port_out8(0x03C5u, 0x0Fu);
+    (void)v.vram_read8(off);
+    v.vram_write8(off, slot);
+  };
+  auto paint_rich_test_scene = [&](san4::VesaPlanarVideo& v, std::uint16_t mode) {
+    v.reset_mode(mode);
+    const int w = v.active_width();
+    const int h = v.active_height();
+    const auto master_pal = san4::codecs::default_san4_master_palette();
+    std::array<std::uint8_t, 48> brg{};
+    for (int gc = 0; gc < 16; ++gc) {
+      const std::uint32_t c = master_pal[san4::kGrpSlotMap[gc]];
+      brg[static_cast<std::size_t>(gc * 3 + 0)] =
+          static_cast<std::uint8_t>((c & 0xFFu) / 0x11u);
+      brg[static_cast<std::size_t>(gc * 3 + 1)] =
+          static_cast<std::uint8_t>(((c >> 16) & 0xFFu) / 0x11u);
+      brg[static_cast<std::size_t>(gc * 3 + 2)] =
+          static_cast<std::uint8_t>(((c >> 8) & 0xFFu) / 0x11u);
+    }
+    v.begin_smooth_fade(0u, 16u, brg.data(), brg.data(),
+                        san4::kGrpSlotMap.data(), 0.01);
+    v.finish_fade_immediately();
+
+    // Borders & corners (tests u_src_size boundary clamping).
+    for (int x = 0; x < w; ++x) {
+      set_pixel_planar(v, x, 0, static_cast<std::uint8_t>((x * 3) & 15));
+      set_pixel_planar(v, x, h - 1, static_cast<std::uint8_t>((x * 5 + 1) & 15));
+    }
+    for (int y = 0; y < h; ++y) {
+      set_pixel_planar(v, 0, y, static_cast<std::uint8_t>((y * 7 + 2) & 15));
+      set_pixel_planar(v, w - 1, y, static_cast<std::uint8_t>((y * 3 + 9) & 15));
+    }
+    // Diagonal lines (1:1, 2:1, 1:2, anti-diagonals, intersecting corners)
+    // across close and high-contrast color pairs!
+    for (int i = 2; i < 220; ++i) {
+      set_pixel_planar(v, 20 + i, 20 + i, 15u);
+      set_pixel_planar(v, 21 + i, 20 + i, 12u);
+      set_pixel_planar(v, 280 - i, 20 + i, 14u);
+      set_pixel_planar(v, 40 + i * 2, 40 + i, 10u);
+      set_pixel_planar(v, 41 + i * 2, 40 + i, 10u);
+      set_pixel_planar(v, 320 + i, 30 + i * 2, 11u);
+      set_pixel_planar(v, 320 + i, 31 + i * 2, 11u);
+    }
+    // 2x2 checkerboard dither patch at (120..151, 260..291): must suppress xBR!
+    for (int y = 260; y < 292; ++y) {
+      for (int x = 120; x < 152; ++x) {
+        set_pixel_planar(v, x, y, ((x + y) & 1) ? 9u : 2u);
+      }
+    }
+    // Glyph-guarded diagonal patch at (200..231, 260..291): must stay crisp!
+    for (int i = 0; i < 30; ++i) {
+      set_pixel_planar(v, 200 + i, 260 + i, 15u);
+      set_pixel_planar(v, 230 - i, 260 + i, 13u);
+    }
+    v.mark_glyph_rect(200, 260, 32, 32);
+    // Pseudo-random multi-color cluster at (420..500, 160..240) for exhaustive
+    // 5x5 neighborhood coverage (including fill_4x_corner overlap ordering!).
+    std::uint32_t seed = 0x9E3779B9u;
+    for (int y = 160; y < 240; ++y) {
+      for (int x = 420; x < 500; ++x) {
+        seed = seed * 1664525u + 1013904223u;
+        if (((seed >> 24) & 3u) == 0u) {
+          set_pixel_planar(v, x, y, static_cast<std::uint8_t>((seed >> 16) & 15u));
+        }
+      }
+    }
+    v.clear_hd_occlude_bits();
+    v.latch_frame();
+  };
+
+  auto assert_pixel_parity = [&](const char* label,
+                                 const std::vector<std::uint32_t>& cpu_px,
+                                 int out_w, int out_h,
+                                 const std::vector<std::uint32_t>& gpu_px) -> bool {
+    if (gpu_px.size() != cpu_px.size()) {
+      std::cerr << "[FAIL] " << label << ": size mismatch cpu=" << cpu_px.size()
+                << " gpu=" << gpu_px.size() << "\n";
+      ++g_failures;
+      return false;
+    }
+    for (std::size_t i = 0; i < cpu_px.size(); ++i) {
+      if (cpu_px[i] != gpu_px[i]) {
+        const int x = static_cast<int>(i % static_cast<std::size_t>(out_w));
+        const int y = static_cast<int>(i / static_cast<std::size_t>(out_w));
+        std::cerr << "[FAIL] " << label << ": pixel mismatch at (" << x << ", "
+                  << y << ") of " << out_w << "x" << out_h << " cpu=0x"
+                  << std::hex << cpu_px[i] << " gpu=0x" << gpu_px[i] << std::dec
+                  << "\n";
+        ++g_failures;
+        return false;
+      }
+    }
+    return true;
+  };
+
+  san4::ThreadPool pool(4);
+  auto m_cpu = std::make_unique<san4::X86Machine>();
+  auto m_gpu = std::make_unique<san4::X86Machine>();
+  m_cpu->hd_pack().set_thread_pool(&pool);
+  m_gpu->hd_pack().set_thread_pool(&pool);
+
+  san4::PixelUpscaler up_cpu(4);
+  up_cpu.set_thread_pool(&pool);
+  up_cpu.set_dirty_policy(san4::UpscaleDirtyPolicy::TileRowSpans);
+
+  san4::PixelUpscaler up_gpu(4);
+  up_gpu.set_canvas_enabled(false);
+
+  san4::EmuSession sess_cpu(*m_cpu, up_cpu);
+  san4::EmuSession sess_gpu(*m_gpu, up_gpu);
+  san4::GpuFrameMailbox gmb;
+  gmb.set_thread_pool(&pool);
+  std::vector<std::uint32_t> gpu_readback;
+
+  // 2) Full-frame parity across ALL 5 UpscaleModes at 800x600!
+  paint_rich_test_scene(m_cpu->video(), 0x0102u);
+  paint_rich_test_scene(m_gpu->video(), 0x0102u);
+
+  static constexpr san4::UpscaleMode kAllModes[] = {
+      san4::UpscaleMode::Nearest, san4::UpscaleMode::Sharp2x,
+      san4::UpscaleMode::Scale2x, san4::UpscaleMode::Xbr2x,
+      san4::UpscaleMode::Xbr4x,
+  };
+  for (san4::UpscaleMode mode : kAllModes) {
+    up_cpu.set_mode(mode);
+    up_gpu.set_mode(mode);
+    bool full_cpu = true;
+    bool full_gpu = true;
+    sess_cpu.produce_frame(full_cpu, nullptr);
+    sess_gpu.produce_gpu_frame(full_gpu, gmb, nullptr);
+    const auto* slot = gmb.acquire();
+    CHECK(slot != nullptr);
+    const auto up_res = gl_test.renderer.upload_and_compose(*slot);
+    CHECK(up_res.ok && up_res.recomposed);
+    CHECK(gl_test.renderer.readback_composed_argb(gpu_readback));
+    const std::string label =
+        std::string("800x600 base ") + san4::PixelUpscaler::mode_name(mode);
+    if (!assert_pixel_parity(label.c_str(), up_cpu.output_argb(),
+                             up_cpu.output_width(), up_cpu.output_height(),
+                             gpu_readback)) {
+      return;
+    }
+    // Also exercise Pass 2 present() onto the hidden window's backbuffer!
+    gl_test.renderer.present(64, 64, 0, 8, 64, 48);
+  }
+
+  // 3) Incremental dirty-tile scissor update + 2-px xBR halo across tile edges
+  //    AND zero-upload 24-bit smooth crossfade parity at Xbr4x (3200x2400)!
+  {
+    // Mutate pixels right at 16x16 tile boundaries (x=15, 16, y=31, 32)!
+    for (san4::VesaPlanarVideo* pv : {&m_cpu->video(), &m_gpu->video()}) {
+      set_pixel_planar(*pv, 15, 31, 14u);
+      set_pixel_planar(*pv, 16, 32, 11u);
+      set_pixel_planar(*pv, 450, 199, 6u);
+      pv->clear_hd_occlude_bits();
+      pv->latch_frame();
+    }
+    bool full_cpu = false;
+    bool full_gpu = false;
+    sess_cpu.produce_frame(full_cpu, nullptr);
+    sess_gpu.produce_gpu_frame(full_gpu, gmb, nullptr);
+    const auto* slot = gmb.acquire();
+    CHECK(slot != nullptr);
+    const auto up_res = gl_test.renderer.upload_and_compose(*slot);
+    CHECK(up_res.ok && up_res.recomposed);
+    CHECK(up_res.uploaded_texels > 0u && up_res.uploaded_texels < 800u * 600u);
+    CHECK(gl_test.renderer.readback_composed_argb(gpu_readback));
+    if (!assert_pixel_parity("800x600 incremental Xbr4x halo",
+                             up_cpu.output_argb(), 3200, 2400, gpu_readback)) {
+      return;
+    }
+
+    // Smooth crossfade mid-step: zero VRAM texels uploaded, 100% pixel parity!
+    std::array<std::uint8_t, 48> src_brg{};
+    std::array<std::uint8_t, 48> dst_brg{};
+    for (int i = 0; i < 48; ++i) {
+      src_brg[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i & 15);
+      dst_brg[static_cast<std::size_t>(i)] =
+          static_cast<std::uint8_t>(15 - (i & 15));
+    }
+    for (san4::VesaPlanarVideo* pv : {&m_cpu->video(), &m_gpu->video()}) {
+      pv->begin_smooth_fade(0u, 16u, src_brg.data(), dst_brg.data(),
+                            san4::kGrpSlotMap.data(), 0.25);
+      pv->advance_fade(0.09);
+      pv->latch_frame();
+    }
+    sess_cpu.produce_frame(full_cpu, nullptr);
+    sess_gpu.produce_gpu_frame(full_gpu, gmb, nullptr);
+    const auto* fade_slot = gmb.acquire();
+    CHECK(fade_slot != nullptr);
+    const auto fade_res = gl_test.renderer.upload_and_compose(*fade_slot);
+    CHECK(fade_res.ok && fade_res.recomposed && fade_res.uploaded_texels == 0u);
+    CHECK(gl_test.renderer.readback_composed_argb(gpu_readback));
+    if (!assert_pixel_parity("800x600 smooth fade Xbr4x", up_cpu.output_argb(),
+                             3200, 2400, gpu_readback)) {
+      return;
+    }
+  }
+
+  // 4) 640x480 VGA Mode 0x0012 parity (verifies non-800x600 u_src_size clamping).
+  paint_rich_test_scene(m_cpu->video(), 0x0012u);
+  paint_rich_test_scene(m_gpu->video(), 0x0012u);
+  for (san4::UpscaleMode mode :
+       {san4::UpscaleMode::Xbr2x, san4::UpscaleMode::Xbr4x}) {
+    up_cpu.set_mode(mode);
+    up_gpu.set_mode(mode);
+    bool full_cpu = true;
+    bool full_gpu = true;
+    sess_cpu.produce_frame(full_cpu, nullptr);
+    sess_gpu.produce_gpu_frame(full_gpu, gmb, nullptr);
+    const auto* slot = gmb.acquire();
+    CHECK(slot != nullptr);
+    CHECK(gl_test.renderer.upload_and_compose(*slot).ok);
+    CHECK(gl_test.renderer.readback_composed_argb(gpu_readback));
+    const std::string label =
+        std::string("640x480 base ") + san4::PixelUpscaler::mode_name(mode);
+    if (!assert_pixel_parity(label.c_str(), up_cpu.output_argb(),
+                             up_cpu.output_width(), up_cpu.output_height(),
+                             gpu_readback)) {
+      return;
+    }
+  }
+
+  // 5) 3200x2400 HD Overlay + 1x/2x/4x Box Reduction + 17x17x17 Trilinear 3D LUT
+  //    Color Grading + Straight-Alpha Blending + Occlusion + clear_overlays()!
+  {
+    ScopedTempDir tmp;
+    const auto pack_dir = tmp.path() / "parity_hd_pack";
+    std::filesystem::create_directories(pack_dir / "tiles");
+
+    const auto master_pal = san4::codecs::default_san4_master_palette();
+    std::array<std::uint8_t, 256> slots_graded{};
+    slots_graded.fill(san4::kGrpSlotMap[3]);
+    slots_graded[0] = san4::kGrpSlotMap[11];
+    slots_graded[17] = san4::kGrpSlotMap[14];
+    const std::uint64_t hash_graded =
+        san4::HdPackManager::hash_sprite_4bit(16, 16, slots_graded.data());
+
+    std::array<std::uint8_t, 256> slots_ungraded{};
+    slots_ungraded.fill(san4::kGrpSlotMap[5]);
+    slots_ungraded[2] = san4::kGrpSlotMap[15];
+    const std::uint64_t hash_ungraded =
+        san4::HdPackManager::hash_sprite_4bit(16, 16, slots_ungraded.data());
+
+    // Build 64x64 HD textures with rich straight-alpha gradients (0..255) and
+    // non-grid RGB values to test every rounding bit of box reduction, 3D LUT
+    // trilinear interpolation, and div255_exact blending!
+    std::vector<std::uint32_t> px_graded(64u * 64u);
+    std::vector<std::uint32_t> px_ungraded(64u * 64u);
+    for (int y = 0; y < 64; ++y) {
+      for (int x = 0; x < 64; ++x) {
+        const auto a = static_cast<std::uint32_t>((x * 4 + y * 3) & 255);
+        const auto r = static_cast<std::uint32_t>((x * 13 + y * 7 + 19) & 255);
+        const auto g = static_cast<std::uint32_t>((x * 5 + y * 17 + 83) & 255);
+        const auto b = static_cast<std::uint32_t>((x * 19 + y * 11 + 41) & 255);
+        px_graded[static_cast<std::size_t>(y * 64 + x)] =
+            (a << 24) | (r << 16) | (g << 8) | b;
+        const auto a2 = static_cast<std::uint32_t>(((63 - x) * 5 + y * 2) & 255);
+        px_ungraded[static_cast<std::size_t>(y * 64 + x)] =
+            (a2 << 24) | (b << 16) | (r << 8) | g;
+      }
+    }
+    CHECK(san4::HdPackManager::save_argb_png(
+        pack_dir / "tiles" / "graded.png", 64, 64, px_graded.data()));
+    char loose_name[64];
+    std::snprintf(loose_name, sizeof(loose_name), "img_16x16_%016llx.png",
+                  static_cast<unsigned long long>(hash_ungraded));
+    CHECK(san4::HdPackManager::save_argb_png(pack_dir / loose_name, 64, 64,
+                                             px_ungraded.data()));
+    {
+      std::string csv;
+      char buf[16];
+      for (int i = 0; i < 16; ++i) {
+        if (i > 0) csv.push_back(',');
+        std::snprintf(buf, sizeof(buf), "%06X",
+                      master_pal[static_cast<std::size_t>(i)] & 0x00FFFFFFu);
+        csv += buf;
+      }
+      std::ofstream mf(pack_dir / "hd_manifest.tsv", std::ios::binary);
+      char hbuf[32];
+      std::snprintf(hbuf, sizeof(hbuf), "%016llx",
+                    static_cast<unsigned long long>(hash_graded));
+      mf << hbuf << "\t16\t16\t1\ttiles/graded.png\t" << csv << "\n";
+    }
+
+    paint_rich_test_scene(m_cpu->video(), 0x0102u);
+    paint_rich_test_scene(m_gpu->video(), 0x0102u);
+    m_cpu->hd_pack().set_pack_dir(pack_dir);
+    m_gpu->hd_pack().set_pack_dir(pack_dir);
+
+    const san4::GrpClipRect full_clip{0, 0, 799, 599};
+    const auto raw_graded = encode_planar_16x16(slots_graded);
+    const auto raw_ungraded = encode_planar_16x16(slots_ungraded);
+    for (san4::X86Machine* pm : {m_cpu.get(), m_gpu.get()}) {
+      pm->hd_pack().on_planar_blit_source(32, 32, 16, 16, 4, 0u, 0u, 0u, 0u,
+                                          full_clip, raw_graded, pm->video());
+      pm->hd_pack().on_planar_blit_source(40, 36, 16, 16, 4, 0u, 0u, 4u, 0u,
+                                          full_clip, raw_ungraded, pm->video());
+      // Partial dialog-border VRAM occlusion across (36..44, 34)!
+      set_pixel_planar(pm->video(), 36, 34, 15u);
+      set_pixel_planar(pm->video(), 37, 34, 15u);
+      pm->video().latch_frame();
+    }
+
+    // 5a) Identity palette HD parity across Nearest (1x), Xbr2x (2x), Xbr4x (4x).
+    for (san4::UpscaleMode mode : {san4::UpscaleMode::Nearest,
+                                   san4::UpscaleMode::Xbr2x,
+                                   san4::UpscaleMode::Xbr4x}) {
+      up_cpu.set_mode(mode);
+      up_gpu.set_mode(mode);
+      bool full_cpu = true;
+      bool full_gpu = true;
+      sess_cpu.produce_frame(full_cpu, nullptr);
+      sess_gpu.produce_gpu_frame(full_gpu, gmb, nullptr);
+      const auto* slot = gmb.acquire();
+      CHECK(slot != nullptr && slot->hd_active);
+      CHECK(gl_test.renderer.upload_and_compose(*slot).ok);
+      CHECK(gl_test.renderer.readback_composed_argb(gpu_readback));
+      const std::string label =
+          std::string("HD identity ") + san4::PixelUpscaler::mode_name(mode);
+      if (!assert_pixel_parity(label.c_str(), up_cpu.output_argb(),
+                               up_cpu.output_width(), up_cpu.output_height(),
+                               gpu_readback)) {
+        return;
+      }
+    }
+
+    // 5b) Active mid-fade 3D LUT trilinear grading parity across 1x, 2x, 4x!
+    std::array<std::uint8_t, 48> src_brg{};
+    std::array<std::uint8_t, 48> dst_brg{};
+    for (int gc = 0; gc < 16; ++gc) {
+      const std::uint32_t c = master_pal[san4::kGrpSlotMap[gc]];
+      src_brg[static_cast<std::size_t>(gc * 3 + 0)] =
+          static_cast<std::uint8_t>((c & 0xFFu) / 0x11u);
+      src_brg[static_cast<std::size_t>(gc * 3 + 1)] =
+          static_cast<std::uint8_t>(((c >> 16) & 0xFFu) / 0x11u);
+      src_brg[static_cast<std::size_t>(gc * 3 + 2)] =
+          static_cast<std::uint8_t>(((c >> 8) & 0xFFu) / 0x11u);
+      dst_brg[static_cast<std::size_t>(gc * 3 + 0)] =
+          static_cast<std::uint8_t>((gc * 3 + 2) & 15);
+      dst_brg[static_cast<std::size_t>(gc * 3 + 1)] =
+          static_cast<std::uint8_t>((gc * 5 + 1) & 15);
+      dst_brg[static_cast<std::size_t>(gc * 3 + 2)] =
+          static_cast<std::uint8_t>((gc * 7 + 4) & 15);
+    }
+    for (san4::X86Machine* pm : {m_cpu.get(), m_gpu.get()}) {
+      pm->video().begin_smooth_fade(0u, 16u, src_brg.data(), dst_brg.data(),
+                                    san4::kGrpSlotMap.data(), 0.30);
+      pm->video().advance_fade(0.11);
+      pm->video().latch_frame();
+    }
+    for (san4::UpscaleMode mode : {san4::UpscaleMode::Nearest,
+                                   san4::UpscaleMode::Sharp2x,
+                                   san4::UpscaleMode::Xbr2x,
+                                   san4::UpscaleMode::Xbr4x}) {
+      up_cpu.set_mode(mode);
+      up_gpu.set_mode(mode);
+      bool full_cpu = false;
+      bool full_gpu = false;
+      sess_cpu.produce_frame(full_cpu, nullptr);
+      sess_gpu.produce_gpu_frame(full_gpu, gmb, nullptr);
+      const auto* slot = gmb.acquire();
+      CHECK(slot != nullptr && slot->hd_active && !slot->luts.empty());
+      CHECK(gl_test.renderer.upload_and_compose(*slot).ok);
+      CHECK(gl_test.renderer.readback_composed_argb(gpu_readback));
+      const std::string label =
+          std::string("HD 3D-LUT fade ") + san4::PixelUpscaler::mode_name(mode);
+      if (!assert_pixel_parity(label.c_str(), up_cpu.output_argb(),
+                               up_cpu.output_width(), up_cpu.output_height(),
+                               gpu_readback)) {
+        return;
+      }
+    }
+
+    // 5c) Incremental HD sprite blit (force_full=false) + clear_overlays()!
+    for (san4::X86Machine* pm : {m_cpu.get(), m_gpu.get()}) {
+      pm->hd_pack().on_planar_blit_source(100, 120, 16, 16, 4, 0u, 0u, 0u, 0u,
+                                          full_clip, raw_graded, pm->video());
+      pm->video().latch_frame();
+    }
+    {
+      bool full_cpu = false;
+      bool full_gpu = false;
+      sess_cpu.produce_frame(full_cpu, nullptr);
+      sess_gpu.produce_gpu_frame(full_gpu, gmb, nullptr);
+      const auto* slot = gmb.acquire();
+      CHECK(slot != nullptr);
+      const auto up_res = gl_test.renderer.upload_and_compose(*slot);
+      CHECK(up_res.ok && up_res.recomposed);
+      CHECK(gl_test.renderer.readback_composed_argb(gpu_readback));
+      if (!assert_pixel_parity("HD incremental sprite blit Xbr4x",
+                               up_cpu.output_argb(), 3200, 2400,
+                               gpu_readback)) {
+        return;
+      }
+    }
+    for (san4::X86Machine* pm : {m_cpu.get(), m_gpu.get()}) {
+      pm->hd_pack().clear_overlays();
+      pm->video().latch_frame();
+    }
+    {
+      bool full_cpu = false;
+      bool full_gpu = false;
+      sess_cpu.produce_frame(full_cpu, nullptr);
+      sess_gpu.produce_gpu_frame(full_gpu, gmb, nullptr);
+      const auto* slot = gmb.acquire();
+      CHECK(slot != nullptr && !slot->hd_active);
+      CHECK(gl_test.renderer.upload_and_compose(*slot).ok);
+      CHECK(gl_test.renderer.readback_composed_argb(gpu_readback));
+      if (!assert_pixel_parity("HD clear_overlays() Xbr4x",
+                               up_cpu.output_argb(), 3200, 2400,
+                               gpu_readback)) {
+        return;
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -10242,9 +11292,13 @@ int main() {
       test_dos_kernel_console_ioctl_tsr_and_video_bios_ports,
       test_machine_grp600c_hle_intercepts_pit_ch0_and_sync_loop,
       test_embedded_game_vfs_memory_exec_cow_and_cli,
+      test_gpu_render_policy_and_gl_loader,
+      test_gpu_frame_mailbox_dirty_tiles_and_concurrency,
+      test_hd_pack_gpu_metadata_and_lut_stability,
+      test_opengl33_gpu_vs_cpu_pixel_parity,
   };
-  static_assert(sizeof(kSuites) / sizeof(kSuites[0]) == 71u);
-  // Invoke through a volatile pointer so LTO/ASan cannot inline all 71 suites'
+  static_assert(sizeof(kSuites) / sizeof(kSuites[0]) == 75u);
+  // Invoke through a volatile pointer so LTO/ASan cannot inline all 75 suites'
   // X86Machine / VesaPlanarVideo stack frames into a single giant main() frame.
   for (SuiteFn suite : kSuites) {
     SuiteFn volatile run = suite;
@@ -10255,6 +11309,6 @@ int main() {
     std::cerr << "[san4_tests] FAILED (" << g_failures << " error(s))\n";
     return 1;
   }
-  std::cout << "[san4_tests] ALL 71 CONFORMANCE & BENCHMARK SUITES PASSED\n";
+  std::cout << "[san4_tests] ALL 75 CONFORMANCE & BENCHMARK SUITES PASSED\n";
   return 0;
 }

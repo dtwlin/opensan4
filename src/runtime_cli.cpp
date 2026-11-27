@@ -41,7 +41,7 @@ void print_runtime_usage(std::ostream& out, const char* prog) {
       << "  --deterministic        With --headless-script: budget guest bursts by\n"
       << "                         instruction count (not wall clock) and derive DOS\n"
       << "                         time from guest ticks so screenshots replay exactly\n"
-      << "  --renderer <MODE>      Present profile: auto (default) | gpu | cpu\n"
+      << "  --renderer <MODE>      Renderer: auto (default, OpenGL 3.3 GPU if available) | gpu | cpu\n"
       << "  --profile-frames <TSV> Write per-frame timings to TSV and print a GRP600C\n"
       << "                         call census at exit\n"
       << "  --threads <0..64>      Worker threads for upscaling/compositing (default 0 = auto)\n"

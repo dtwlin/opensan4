@@ -270,6 +270,10 @@ set(SAN4_CORE_SOURCES
   src/machine.cpp
   src/render_policy.cpp
   src/frame_mailbox.cpp
+  src/gpu/gl_loader.cpp
+  src/gpu/gl_shaders.cpp
+  src/gpu/gl_renderer.cpp
+  src/gpu/gpu_frame_mailbox.cpp
   src/emu_session.cpp
   src/sdl_host.cpp
   src/util/simd_blend.cpp

@@ -19,6 +19,7 @@
 namespace san4 {
 
 class ThreadPool;
+struct GpuHdInput;
 
 struct HdTexture {
   int base_w = 0;
@@ -246,6 +247,17 @@ class HdPackManager {
       std::span<const UpscaleDirtyRect> dirty_rects,
       std::vector<UpscaleDirtyRect>& out_rects) const;
 
+  // Metadata-only HD state preparation for the OpenGL 3.3 GPU compositor:
+  // updates changed 16x16 tiles of the 800x600 LUT key-slot index map and
+  // resolves active 17x17x17 grading LUTs without running CPU 3200x2400 pixel
+  // blending.
+  void prepare_gpu_composite_state(const VesaPlanarVideo& video,
+                                   bool force_full, GpuHdInput& out) const;
+  const std::array<std::uint64_t, VesaPlanarVideo::kTileCount>&
+  hd_canvas_tile_gen() const noexcept {
+    return hd_canvas_tile_gen_;
+  }
+
   // Helpers exposed for unit testing and sprite PNG I/O.
   static bool parse_sprite_filename(std::string_view filename, int& out_w,
                                     int& out_h, std::uint64_t& out_hash);
@@ -420,6 +432,9 @@ class HdPackManager {
                          PaletteGradingLut& lut) const;
   void resolve_band_luts(int band_begin, int band_end,
                          const VesaPlanarVideo& video) const;
+  void resolve_gpu_luts(const VesaPlanarVideo& video,
+                        bool force_rebuild) const;
+  void reset_gpu_tracking() const noexcept;
   void trim_lut_cache() const;
   // fn(chunk_begin, chunk_end) over [begin, end) on pool_ (grain 1), or
   // inline without a pool.
@@ -486,6 +501,30 @@ class HdPackManager {
   mutable std::array<std::uint8_t, VesaPlanarVideo::kTileCount>
       hd_dirty_tiles_{};
   mutable bool hd_dirty_any_ = false;
+  // Monotonic per-tile generation of `hd_canvas_argb_` / logical HD metadata.
+  mutable std::uint64_t hd_canvas_gen_ = 0;
+  mutable std::array<std::uint64_t, VesaPlanarVideo::kTileCount>
+      hd_canvas_tile_gen_{};
+  mutable bool gpu_mask_widened_ = false;
+
+  // GPU compositor metadata cache (lazily populated when GPU path is active).
+  mutable bool gpu_was_active_ = false;
+  mutable bool gpu_luts_valid_ = false;
+  mutable std::uint32_t gpu_last_palette_gen_ = 0;
+  mutable bool gpu_last_is_fading_ = false;
+  mutable std::uint64_t gpu_lut_idx_gen_ = 0;
+  mutable std::uint64_t gpu_luts_gen_ = 0;
+  mutable std::vector<std::uint16_t> gpu_lut_idx_map_;
+  mutable std::array<std::uint64_t, VesaPlanarVideo::kTileCount>
+      gpu_lut_idx_tile_gen_{};
+  mutable std::array<std::uint64_t, VesaPlanarVideo::kTileCount>
+      gpu_seen_vram_tile_gen_{};
+  mutable std::array<std::uint64_t, VesaPlanarVideo::kTileCount>
+      gpu_seen_hd_tile_gen_{};
+  mutable std::vector<std::uint64_t> gpu_key_slots_;
+  mutable std::unordered_map<std::uint64_t, std::uint16_t> gpu_key_to_slot_;
+  mutable std::vector<std::array<std::uint32_t, 17 * 17 * 17>> gpu_luts_;
+  mutable std::array<int, 256> gpu_lut_slot_map_{};
 
   // Compositor scratch, reused across frames.
   mutable std::vector<CompositeBand> bands_;

@@ -142,6 +142,7 @@ SdlHost::SdlHost(const HostOptions& opts)
   upscaler_.set_dirty_policy(UpscaleDirtyPolicy::TileRowSpans);
   machine_.hd_pack().set_thread_pool(pool_.get());
   mailbox_.set_thread_pool(pool_.get());
+  gpu_mailbox_.set_thread_pool(pool_.get());
   cached_cursor_shape_ = machine_.mouse().cursor_shape();
   cached_cursor_visible_ = machine_.mouse().cursor_visible();
 
@@ -249,40 +250,47 @@ bool SdlHost::init_sdl() {
 #else
   constexpr const char* kWindowTitleBase = "SAN4 Native Linux";
 #endif
-  window_ = SDL_CreateWindow(kWindowTitleBase, SDL_WINDOWPOS_CENTERED,
-                             SDL_WINDOWPOS_CENTERED, win_w, win_h, win_flags);
-  if (!window_) {
-    std::cerr << "[san4] SDL_CreateWindow failed: " << SDL_GetError() << "\n";
-    return false;
-  }
 
-  if (opts_.headless_script.empty()) {
-    if (!create_interactive_renderer(true)) {
+  if (!should_probe_opengl(opts_.renderer, headless) ||
+      !try_init_opengl_backend(kWindowTitleBase, win_w, win_h, win_flags,
+                               true)) {
+    window_ = SDL_CreateWindow(kWindowTitleBase, SDL_WINDOWPOS_CENTERED,
+                               SDL_WINDOWPOS_CENTERED, win_w, win_h, win_flags);
+    if (!window_) {
+      std::cerr << "[san4] SDL_CreateWindow failed: " << SDL_GetError() << "\n";
       return false;
     }
-  } else {
-    renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED);
-    if (!renderer_) {
-      renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_SOFTWARE);
-    }
-    if (!renderer_) {
-      std::cerr << "[san4] SDL_CreateRenderer failed: " << SDL_GetError()
-                << "\n";
-      return false;
-    }
-  }
 
-  if (!recreate_frame_texture(upscaler_.output_width(),
-                              upscaler_.output_height(), upscaler_.mode())) {
-    if (upscaler_.mode() != UpscaleMode::Nearest) {
-      upscaler_.set_mode(UpscaleMode::Nearest);
-      if (!recreate_frame_texture(upscaler_.output_width(),
-                                  upscaler_.output_height(),
-                                  upscaler_.mode())) {
+    if (opts_.headless_script.empty()) {
+      if (!create_interactive_renderer(true)) {
         return false;
       }
     } else {
-      return false;
+      render_backend_ = RenderBackendKind::SdlRenderer;
+      upscaler_.set_canvas_enabled(true);
+      renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED);
+      if (!renderer_) {
+        renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_SOFTWARE);
+      }
+      if (!renderer_) {
+        std::cerr << "[san4] SDL_CreateRenderer failed: " << SDL_GetError()
+                  << "\n";
+        return false;
+      }
+    }
+
+    if (!recreate_frame_texture(upscaler_.output_width(),
+                                upscaler_.output_height(), upscaler_.mode())) {
+      if (upscaler_.mode() != UpscaleMode::Nearest) {
+        upscaler_.set_mode(UpscaleMode::Nearest);
+        if (!recreate_frame_texture(upscaler_.output_width(),
+                                    upscaler_.output_height(),
+                                    upscaler_.mode())) {
+          return false;
+        }
+      } else {
+        return false;
+      }
     }
   }
 
@@ -386,7 +394,163 @@ void SdlHost::open_audio_device(bool verbose_log) {
   }
 }
 
+bool SdlHost::try_init_opengl_backend(const char* title, int win_w, int win_h,
+                                      std::uint32_t base_win_flags,
+                                      bool verbose_log) {
+  auto cleanup_failed_gl = [&](std::string_view reason) {
+    if (verbose_log && opts_.renderer == RendererPreference::Gpu) {
+      std::cerr << "[san4-render] OpenGL 3.3 unavailable (" << reason
+                << "); falling back to SDL renderer\n";
+    }
+    if (gl_renderer_) {
+      if (window_ != nullptr && gl_context_ != nullptr) {
+        SDL_GL_MakeCurrent(window_, gl_context_);
+      }
+      gl_renderer_->shutdown();
+      gl_renderer_.reset();
+    }
+    if (gl_context_ != nullptr) {
+      SDL_GL_DeleteContext(gl_context_);
+      gl_context_ = nullptr;
+    }
+    if (window_ != nullptr) {
+      SDL_DestroyWindow(window_);
+      window_ = nullptr;
+    }
+    render_backend_ = RenderBackendKind::SdlRenderer;
+    SDL_GL_ResetAttributes();
+    return false;
+  };
+
+  SDL_GL_ResetAttributes();
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+  SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+  SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+
+  const Uint32 gl_win_flags =
+      (base_win_flags &
+       ~static_cast<Uint32>(SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN_DESKTOP)) |
+      SDL_WINDOW_HIDDEN | SDL_WINDOW_OPENGL;
+  window_ = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED,
+                             SDL_WINDOWPOS_CENTERED, win_w, win_h,
+                             gl_win_flags);
+  if (!window_) {
+    return cleanup_failed_gl(SDL_GetError());
+  }
+
+  gl_context_ = SDL_GL_CreateContext(window_);
+  if (gl_context_ == nullptr) {
+    return cleanup_failed_gl(SDL_GetError());
+  }
+  SDL_GL_MakeCurrent(window_, gl_context_);
+
+  gpu::GlProcs procs{};
+  std::string missing_sym;
+  const bool procs_ok = procs.load(
+      +[](const char* name) -> void* { return SDL_GL_GetProcAddress(name); },
+      &missing_sym);
+
+  std::string gl_renderer_str;
+  std::string gl_version_str;
+  if (procs.GetString != nullptr) {
+    if (const auto* r = procs.GetString(gpu::kGlRenderer)) {
+      gl_renderer_str = reinterpret_cast<const char*>(r);
+    }
+    if (const auto* v = procs.GetString(gpu::kGlVersion)) {
+      gl_version_str = reinterpret_cast<const char*>(v);
+    }
+  }
+
+  GlCapabilities caps{};
+  caps.context_ok = true;
+  caps.procs_ok = procs_ok;
+  if (procs.GetIntegerv != nullptr) {
+    gpu::GLint maj = 0;
+    gpu::GLint min = 0;
+    gpu::GLint max_tex = 0;
+    procs.GetIntegerv(gpu::kGlMajorVersion, &maj);
+    procs.GetIntegerv(gpu::kGlMinorVersion, &min);
+    procs.GetIntegerv(gpu::kGlMaxTextureSize, &max_tex);
+    if (procs.GetError != nullptr) {
+      while (procs.GetError() != gpu::kGlNoError) {
+      }
+    }
+    caps.major_version = static_cast<int>(maj);
+    caps.minor_version = static_cast<int>(min);
+    caps.max_texture_size = static_cast<int>(max_tex);
+  }
+  if (caps.major_version == 0 && !gl_version_str.empty()) {
+    gpu::parse_gl_version(gl_version_str, caps.major_version,
+                          caps.minor_version);
+  }
+  caps.gl_renderer = gl_renderer_str;
+
+  if (select_render_backend(opts_.renderer, caps) !=
+      RenderBackendKind::OpenGL33) {
+    const std::string why =
+        !procs_ok
+            ? ("missing " + missing_sym)
+            : ("GL='" + gl_version_str + "' renderer='" + gl_renderer_str +
+               "' max_tex=" + std::to_string(caps.max_texture_size));
+    return cleanup_failed_gl(why);
+  }
+
+  gl_renderer_ = std::make_unique<gpu::GlRenderer>();
+  std::string gl_err;
+  if (!gl_renderer_->init(procs, &gl_err)) {
+    return cleanup_failed_gl(gl_err);
+  }
+
+  render_backend_ = RenderBackendKind::OpenGL33;
+  render_profile_ =
+      select_render_profile(opts_.renderer, "opengl", gl_renderer_str);
+  SDL_ShowWindow(window_);
+  if (fullscreen_) {
+    SDL_SetWindowFullscreen(window_, SDL_WINDOW_FULLSCREEN_DESKTOP);
+  }
+
+  SDL_DisplayMode display_mode{};
+  const int refresh_hz = (SDL_GetWindowDisplayMode(window_, &display_mode) == 0)
+                             ? display_mode.refresh_rate
+                             : 0;
+  has_vsync_ = select_vsync(render_profile_, refresh_hz) &&
+               (SDL_GL_SetSwapInterval(1) == 0);
+  if (!has_vsync_) {
+    SDL_GL_SetSwapInterval(0);
+  }
+
+  upscaler_.set_canvas_enabled(false);
+  present_.texture_replaced();
+
+  if (!emu_thread_.running()) {
+    session_.set_auto_scale_policy(EmuSession::AutoScalePolicy{
+        .profile = render_profile_,
+        .hd_pack = !opts_.hd_pack_dir.empty(),
+        .explicit_scale = opts_.explicit_scale,
+    });
+  }
+  apply_auto_scale();
+  if (verbose_log) {
+    const UpscaleMode active_mode =
+        emu_thread_.running() ? view_status_.mode : upscaler_.mode();
+    std::cout << "[san4-render] backend="
+              << render_backend_name(render_backend_) << " driver=opengl"
+              << " gl_renderer="
+              << (gl_renderer_str.empty() ? "none" : gl_renderer_str)
+              << " profile=" << render_profile_name(render_profile_)
+              << " vsync=" << (has_vsync_ ? 1 : 0)
+              << " scale=" << PixelUpscaler::mode_name(active_mode)
+              << " simd=" << simd::level_name(simd::active_level()) << "\n";
+  }
+  return true;
+}
+
 bool SdlHost::create_interactive_renderer(bool verbose_log) {
+  render_backend_ = RenderBackendKind::SdlRenderer;
+  upscaler_.set_canvas_enabled(true);
   // On Windows, prefer direct3d11 (hardware D3D11 + inbox WARP fallback) over
   // SDL's index-0 legacy direct3d9 driver; on Linux, opengles2 uploads far
   // faster than desktop GL under llvmpipe and is just as fast on real GPUs.
@@ -448,7 +612,9 @@ bool SdlHost::create_interactive_renderer(bool verbose_log) {
   if (verbose_log) {
     const UpscaleMode active_mode =
         emu_thread_.running() ? view_status_.mode : upscaler_.mode();
-    std::cout << "[san4-render] driver=" << (driver.empty() ? "unknown" : driver)
+    std::cout << "[san4-render] backend="
+              << render_backend_name(render_backend_)
+              << " driver=" << (driver.empty() ? "unknown" : driver)
               << " gl_renderer=" << (gl_renderer.empty() ? "none" : gl_renderer)
               << " profile=" << render_profile_name(render_profile_)
               << " vsync=" << (has_vsync_ ? 1 : 0)
@@ -461,6 +627,12 @@ bool SdlHost::create_interactive_renderer(bool verbose_log) {
 bool SdlHost::recreate_renderer_after_reset() {
   if (window_ == nullptr) {
     return false;
+  }
+  if (render_backend_ == RenderBackendKind::OpenGL33) {
+    if (gl_renderer_) {
+      gl_renderer_->reset_tracking();
+    }
+    return gl_renderer_ != nullptr;
   }
   if (texture_ != nullptr) {
     SDL_DestroyTexture(texture_);
@@ -482,11 +654,25 @@ bool SdlHost::recreate_renderer_after_reset() {
   return renderer_ != nullptr;
 }
 
+bool SdlHost::get_drawable_size(int& out_w, int& out_h) const {
+  if (render_backend_ == RenderBackendKind::OpenGL33) {
+    if (window_ == nullptr) {
+      return false;
+    }
+    SDL_GL_GetDrawableSize(window_, &out_w, &out_h);
+    return out_w > 0 && out_h > 0;
+  }
+  if (renderer_ == nullptr) {
+    return false;
+  }
+  return SDL_GetRendererOutputSize(renderer_, &out_w, &out_h) == 0 &&
+         out_w > 0 && out_h > 0;
+}
+
 void SdlHost::apply_auto_scale() {
   int out_w = 0;
   int out_h = 0;
-  if (!opts_.headless_script.empty() || renderer_ == nullptr ||
-      SDL_GetRendererOutputSize(renderer_, &out_w, &out_h) != 0) {
+  if (!opts_.headless_script.empty() || !get_drawable_size(out_w, out_h)) {
     return;
   }
   send(HostCmd::auto_scale(out_h));
@@ -506,6 +692,18 @@ void SdlHost::shutdown_sdl() {
     SDL_FreeCursor(color_cursor_);
     color_cursor_ = nullptr;
   }
+  if (gl_renderer_) {
+    if (window_ != nullptr && gl_context_ != nullptr) {
+      SDL_GL_MakeCurrent(window_, gl_context_);
+    }
+    gl_renderer_->shutdown();
+    gl_renderer_.reset();
+  }
+  if (gl_context_ != nullptr) {
+    SDL_GL_DeleteContext(gl_context_);
+    gl_context_ = nullptr;
+  }
+  render_backend_ = RenderBackendKind::SdlRenderer;
   if (texture_) {
     SDL_DestroyTexture(texture_);
     texture_ = nullptr;
@@ -733,8 +931,8 @@ SdlHost::Viewport SdlHost::compute_window_viewport() const {
 SdlHost::Viewport SdlHost::compute_renderer_viewport() const {
   int rw = VesaPlanarVideo::kWidth;
   int rh = VesaPlanarVideo::kHeight;
-  if (renderer_) {
-    SDL_GetRendererOutputSize(renderer_, &rw, &rh);
+  if (!get_drawable_size(rw, rh) && window_) {
+    SDL_GetWindowSize(window_, &rw, &rh);
   }
   return fit_aspect_4_3(rw, rh);
 }
@@ -748,8 +946,9 @@ void SdlHost::window_to_dos_coords(int wx, int wy, int& out_dx,
   if (window_) {
     SDL_GetWindowSize(window_, &ww, &wh);
   }
-  if (renderer_) {
-    SDL_GetRendererOutputSize(renderer_, &rw, &rh);
+  if (!get_drawable_size(rw, rh)) {
+    rw = 0;
+    rh = 0;
   }
   map_window_to_dos(wx, wy, ww, wh, rw, rh, view_status_.active_w,
                     view_status_.active_h, out_dx, out_dy);
@@ -764,8 +963,9 @@ void SdlHost::dos_to_window_coords(int dx, int dy, int active_w, int active_h,
   if (window_) {
     SDL_GetWindowSize(window_, &ww, &wh);
   }
-  if (renderer_) {
-    SDL_GetRendererOutputSize(renderer_, &rw, &rh);
+  if (!get_drawable_size(rw, rh)) {
+    rw = 0;
+    rh = 0;
   }
   map_dos_to_window(dx, dy, ww, wh, rw, rh, active_w, active_h, out_wx, out_wy);
 }
@@ -1019,6 +1219,13 @@ void SdlHost::handle_keyup(const SDL_KeyboardEvent& ev) {
 }
 
 void SdlHost::handle_render_reset(bool device_reset) {
+  if (render_backend_ == RenderBackendKind::OpenGL33) {
+    if (gl_renderer_) {
+      gl_renderer_->reset_tracking();
+    }
+    present_.texture_replaced();
+    return;
+  }
   int target_w = tex_w_;
   int target_h = tex_h_;
   UpscaleMode target_mode = tex_mode_;
@@ -1218,6 +1425,20 @@ void SdlHost::present_texture() {
   SDL_RenderPresent(renderer_);
 }
 
+void SdlHost::present_gpu_texture() {
+  if (!gl_renderer_ || !window_) {
+    return;
+  }
+  int dw = VesaPlanarVideo::kWidth;
+  int dh = VesaPlanarVideo::kHeight;
+  if (!get_drawable_size(dw, dh)) {
+    SDL_GetWindowSize(window_, &dw, &dh);
+  }
+  const Viewport rvp = fit_aspect_4_3(dw, dh);
+  gl_renderer_->present(dw, dh, rvp.x, rvp.y, rvp.w, rvp.h);
+  SDL_GL_SwapWindow(window_);
+}
+
 void SdlHost::render_and_present(bool& force_full_upscale) {
   const bool profiling = profiler_.enabled();
   session_.produce_frame(force_full_upscale,
@@ -1323,6 +1544,56 @@ bool SdlHost::present_slot(const FrameMailbox::Slot& slot) {
                                             FrameProfiler::Clock::now())
                 : 0.0;
     row.dirty_px = uploaded_px;
+    profiler_.write(row);
+  }
+  return present;
+}
+
+bool SdlHost::present_gpu_slot(const GpuFrameMailbox::Slot& slot) {
+  if (!gl_renderer_ || !window_) {
+    return false;
+  }
+  const bool profiling = profiler_.enabled();
+  FrameProfiler::Clock::time_point t_upload0;
+  FrameProfiler::Clock::time_point t_present0;
+  if (profiling) {
+    t_upload0 = FrameProfiler::Clock::now();
+  }
+
+  const gpu::GlRenderer::UploadResult up =
+      gl_renderer_->upload_and_compose(slot);
+  if (!up.ok) {
+    if (present_.take_scale_fallback(slot.mode)) {
+      send(HostCmd::set_scale(UpscaleMode::Nearest));
+    }
+    return false;
+  }
+
+  const std::uint64_t dirty_work =
+      up.recomposed ? std::max<std::uint64_t>(1u, up.uploaded_texels) : 0u;
+  const bool present = present_.finish_upload(slot.gen, dirty_work);
+  if (slot.status != view_status_) {
+    update_window_title(slot.status);
+  }
+
+  if (profiling) {
+    t_present0 = FrameProfiler::Clock::now();
+  }
+  if (present) {
+    present_gpu_texture();
+    present_.presented();
+    ++presented_frames_;
+  }
+
+  if (profiling) {
+    FrameProfileRow row = slot.profile;
+    row.frame = slot.gen - 1u;
+    row.upload_ms = FrameProfiler::ms_between(t_upload0, t_present0);
+    row.present_ms =
+        present ? FrameProfiler::ms_between(t_present0,
+                                            FrameProfiler::Clock::now())
+                : 0.0;
+    row.dirty_px = up.uploaded_texels;
     profiler_.write(row);
   }
   return present;
@@ -1653,12 +1924,17 @@ int SdlHost::run_interactive() {
   // Longest wait for a new frame before input is polled again.
   constexpr auto kEventPollInterval = std::chrono::milliseconds(8);
 
-  emu_thread_.start(session_, mailbox_, cmd_queue_,
-                    EmuSession::LoopOptions{
-                        .guest_budget_sec = 0.012,
-                        .drain_audio = (audio_dev_ == 0),
-                        .profiling = profiler_.enabled(),
-                    });
+  const EmuSession::LoopOptions loop_opts{
+      .guest_budget_sec = 0.012,
+      .drain_audio = (audio_dev_ == 0),
+      .profiling = profiler_.enabled(),
+  };
+  const bool use_gpu = (render_backend_ == RenderBackendKind::OpenGL33);
+  if (use_gpu) {
+    emu_thread_.start(session_, gpu_mailbox_, cmd_queue_, loop_opts);
+  } else {
+    emu_thread_.start(session_, mailbox_, cmd_queue_, loop_opts);
+  }
   bool running = true;
   while (running) {
     process_sdl_events(running);
@@ -1669,23 +1945,45 @@ int SdlHost::run_interactive() {
 
     const auto present_start = Clock::now();
     bool presented = false;
-    if (const FrameMailbox::Slot* slot = mailbox_.acquire()) {
-      presented = present_slot(*slot);
-    } else if (present_.needs_redraw()) {
-      if (present_.uploaded_gen() == 0u || texture_ == nullptr) {
-        if (const FrameMailbox::Slot* cur = mailbox_.current_acquired()) {
-          presented = present_slot(*cur);
+    if (use_gpu) {
+      if (const GpuFrameMailbox::Slot* slot = gpu_mailbox_.acquire()) {
+        presented = present_gpu_slot(*slot);
+      } else if (present_.needs_redraw()) {
+        if (present_.uploaded_gen() == 0u || !gl_renderer_ ||
+            gl_renderer_->composed_width() <= 0) {
+          if (const GpuFrameMailbox::Slot* cur =
+                  gpu_mailbox_.current_acquired()) {
+            presented = present_gpu_slot(*cur);
+          }
+        } else {
+          present_gpu_texture();
+          present_.presented();
+          presented = true;
         }
-      } else if (present_.uploaded_gen() > 0u && texture_ != nullptr) {
-        present_texture();
-        present_.presented();
-        presented = true;
+      }
+    } else {
+      if (const FrameMailbox::Slot* slot = mailbox_.acquire()) {
+        presented = present_slot(*slot);
+      } else if (present_.needs_redraw()) {
+        if (present_.uploaded_gen() == 0u || texture_ == nullptr) {
+          if (const FrameMailbox::Slot* cur = mailbox_.current_acquired()) {
+            presented = present_slot(*cur);
+          }
+        } else if (present_.uploaded_gen() > 0u && texture_ != nullptr) {
+          present_texture();
+          present_.presented();
+          presented = true;
+        }
       }
     }
     if (presented && !has_vsync_) {
       std::this_thread::sleep_until(present_start + kMinPresentInterval);
     }
-    mailbox_.wait_for_fresh_until(Clock::now() + kEventPollInterval);
+    if (use_gpu) {
+      gpu_mailbox_.wait_for_fresh_until(Clock::now() + kEventPollInterval);
+    } else {
+      mailbox_.wait_for_fresh_until(Clock::now() + kEventPollInterval);
+    }
   }
 
   // Joins before any SDL teardown; rethrows a failure of the emulation loop.

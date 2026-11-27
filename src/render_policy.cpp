@@ -36,12 +36,47 @@ const char* render_profile_name(RenderProfile profile) {
   return profile == RenderProfile::Software ? "sw" : "hw";
 }
 
+const char* render_backend_name(RenderBackendKind backend) noexcept {
+  return backend == RenderBackendKind::OpenGL33 ? "opengl33" : "sdl";
+}
+
 bool is_software_gl_renderer(std::string_view gl_renderer) {
-  static constexpr std::array<std::string_view, 4> kCpuRasterizers = {
-      "llvmpipe", "softpipe", "swrast", "SVGA3D"};
+  static constexpr std::array<std::string_view, 8> kCpuRasterizers = {
+      "llvmpipe",
+      "softpipe",
+      "swrast",
+      "SVGA3D",
+      "lavapipe",
+      "GDI Generic",
+      "Microsoft Basic Render Driver",
+      "WARP",
+  };
   return std::any_of(
       kCpuRasterizers.begin(), kCpuRasterizers.end(),
       [&](std::string_view name) { return contains_ci(gl_renderer, name); });
+}
+
+bool should_probe_opengl(RendererPreference pref, bool headless) noexcept {
+  return !headless && pref != RendererPreference::Cpu;
+}
+
+RenderBackendKind select_render_backend(RendererPreference pref,
+                                        const GlCapabilities& caps) noexcept {
+  if (pref == RendererPreference::Cpu || !caps.context_ok || !caps.procs_ok) {
+    return RenderBackendKind::SdlRenderer;
+  }
+  if (caps.major_version < 3 ||
+      (caps.major_version == 3 && caps.minor_version < 3)) {
+    return RenderBackendKind::SdlRenderer;
+  }
+  if (caps.max_texture_size < kMinOpenGlTextureSize) {
+    return RenderBackendKind::SdlRenderer;
+  }
+  if (pref == RendererPreference::Auto &&
+      is_software_gl_renderer(caps.gl_renderer)) {
+    return RenderBackendKind::SdlRenderer;
+  }
+  return RenderBackendKind::OpenGL33;
 }
 
 RenderProfile select_render_profile(RendererPreference pref,

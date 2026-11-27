@@ -16,6 +16,7 @@
 #include <utility>
 
 #include "grp600c_defs.h"
+#include "gpu/gpu_frame_mailbox.h"
 #include "hd_gen/hd_art_upscaler.h"
 #include "util/simd_blend.h"
 #include "util/string_util.h"
@@ -566,6 +567,7 @@ std::size_t HdPackManager::reload_pack() {
   // so existing hd_ref_pal_id_ entries on hd_canvas_argb_ remain valid on F8.
   lut_cache_.clear();
   lut_lru_.clear();
+  reset_gpu_tracking();
   tile_dict_index_.clear();
   lru_order_.clear();
   cache_.clear();
@@ -837,9 +839,16 @@ void HdPackManager::mark_hd_tiles_dirty(int x0, int y0, int x1, int y1) const {
   const int ty0 = std::max(y0, 0) / kTile;
   const int tx1 = (std::min(x1, VesaPlanarVideo::kWidth) + kTile - 1) / kTile;
   const int ty1 = (std::min(y1, VesaPlanarVideo::kHeight) + kTile - 1) / kTile;
+  if (tx0 >= tx1 || ty0 >= ty1) {
+    return;
+  }
+  const std::uint64_t cgen = ++hd_canvas_gen_;
   for (int ty = ty0; ty < ty1; ++ty) {
     for (int tx = tx0; tx < tx1; ++tx) {
-      hd_dirty_tiles_[static_cast<std::size_t>(ty * VesaPlanarVideo::kTilesX + tx)] = 1u;
+      const auto tidx =
+          static_cast<std::size_t>(ty * VesaPlanarVideo::kTilesX + tx);
+      hd_dirty_tiles_[tidx] = 1u;
+      hd_canvas_tile_gen_[tidx] = cgen;
       hd_dirty_any_ = true;
     }
   }
@@ -1513,7 +1522,14 @@ std::uint32_t HdPackManager::paint_hd_texture_clipped(
           hd_bank_hint_[lidx] = bank_hint;
         } else {
           // Blended into a surviving region: it now also shows these colors.
-          region_used_mask_[hd_region_id_[lidx]] |= used_mask;
+          const std::uint16_t prev_mask =
+              region_used_mask_[hd_region_id_[lidx]];
+          const auto next_mask =
+              static_cast<std::uint16_t>(prev_mask | used_mask);
+          if (next_mask != prev_mask) {
+            region_used_mask_[hd_region_id_[lidx]] = next_mask;
+            gpu_mask_widened_ = true;
+          }
         }
         hd_snap_slot_[lidx] = svram[lidx];
       }
@@ -3031,6 +3047,238 @@ void HdPackManager::composite_overlays(std::vector<std::uint32_t>& canvas,
   inout_dirty_rect.y = uy0;
   inout_dirty_rect.w = ux1 - ux0;
   inout_dirty_rect.h = uy1 - uy0;
+}
+
+void HdPackManager::reset_gpu_tracking() const noexcept {
+  gpu_was_active_ = false;
+  gpu_luts_valid_ = false;
+  gpu_last_palette_gen_ = 0;
+  gpu_last_is_fading_ = false;
+  gpu_mask_widened_ = false;
+  gpu_key_slots_.clear();
+  gpu_key_to_slot_.clear();
+  gpu_luts_.clear();
+  gpu_lut_slot_map_.fill(-1);
+}
+
+void HdPackManager::resolve_gpu_luts(const VesaPlanarVideo& video,
+                                     bool force_rebuild) const {
+  const std::uint32_t gen = video.palette_generation();
+  const bool fading = video.is_fading();
+  if (!force_rebuild && gpu_luts_valid_ && gpu_last_palette_gen_ == gen &&
+      gpu_last_is_fading_ == fading) {
+    return;
+  }
+
+  lut_build_keys_.clear();
+  frame_luts_.clear();
+  for (std::size_t s = 1u; s < gpu_key_slots_.size(); ++s) {
+    const std::uint64_t key = gpu_key_slots_[s];
+    const auto [fit, inserted] = frame_luts_.try_emplace(key, nullptr);
+    if (!inserted ||
+        static_cast<std::uint16_t>(key >> 24u) >= ref_palettes_.size()) {
+      continue;
+    }
+    const auto cit = lut_cache_.find(key);
+    if (cit != lut_cache_.end() && cit->second.lut.palette_gen == gen &&
+        cit->second.lut.is_fading == fading) {
+      lut_lru_.splice(lut_lru_.begin(), lut_lru_, cit->second.lru_it);
+      fit->second = cit->second.lut.is_identity ? nullptr : &cit->second.lut;
+    } else {
+      lut_build_keys_.push_back(key);
+    }
+  }
+
+  const auto n_build = static_cast<int>(lut_build_keys_.size());
+  if (n_build > 0) {
+    if (lut_build_out_.size() < lut_build_keys_.size()) {
+      lut_build_out_.resize(lut_build_keys_.size());
+    }
+    run_parallel(0, n_build, [&](int i0, int i1) {
+      for (int i = i0; i < i1; ++i) {
+        const std::uint64_t key = lut_build_keys_[static_cast<std::size_t>(i)];
+        build_grading_lut(static_cast<std::uint16_t>(key >> 24u),
+                          static_cast<std::uint16_t>(key & 0xFFFFu), video,
+                          lut_build_out_[static_cast<std::size_t>(i)]);
+      }
+    });
+    for (std::size_t i = 0; i < lut_build_keys_.size(); ++i) {
+      const std::uint64_t key = lut_build_keys_[i];
+      const auto [cit, inserted] = lut_cache_.try_emplace(key);
+      if (inserted) {
+        lut_lru_.push_front(key);
+        cit->second.lru_it = lut_lru_.begin();
+      } else {
+        lut_lru_.splice(lut_lru_.begin(), lut_lru_, cit->second.lru_it);
+      }
+      cit->second.lut = lut_build_out_[i];
+      frame_luts_[key] =
+          cit->second.lut.is_identity ? nullptr : &cit->second.lut;
+    }
+  }
+
+  gpu_lut_slot_map_.fill(-1);
+  gpu_luts_.clear();
+  for (std::size_t s = 1u; s < gpu_key_slots_.size() && s < 256u; ++s) {
+    const auto it = frame_luts_.find(gpu_key_slots_[s]);
+    if (it != frame_luts_.end() && it->second != nullptr) {
+      gpu_lut_slot_map_[s] = static_cast<int>(gpu_luts_.size());
+      gpu_luts_.push_back(it->second->grid);
+    }
+  }
+  trim_lut_cache();
+
+  gpu_last_palette_gen_ = gen;
+  gpu_last_is_fading_ = fading;
+  gpu_luts_valid_ = true;
+  ++gpu_luts_gen_;
+}
+
+void HdPackManager::prepare_gpu_composite_state(const VesaPlanarVideo& video,
+                                                bool force_full,
+                                                GpuHdInput& out) const {
+  if (!std::exchange(frame_prepared_, false)) {
+    update_hd_state(video);
+  }
+  const bool cleared = std::exchange(clear_pending_, false);
+  hd_dirty_rects_.clear();
+
+  if (active_region_count_ == 0u) {
+    reset_gpu_tracking();
+    out = GpuHdInput{};
+    return;
+  }
+
+  constexpr int kW = VesaPlanarVideo::kWidth;
+  constexpr int kH = VesaPlanarVideo::kHeight;
+  constexpr int kTile = VesaPlanarVideo::kTileSize;
+  constexpr std::uint64_t kUngradedSentinelKey = ~std::uint64_t{0};
+
+  const std::size_t logical_px = static_cast<std::size_t>(kW) * kH;
+  const bool first_init = (gpu_lut_idx_map_.size() != logical_px);
+  if (first_init) {
+    gpu_lut_idx_map_.assign(logical_px, 0u);
+  }
+
+  bool rescan_all = force_full || !gpu_was_active_ || cleared || first_init ||
+                    std::exchange(gpu_mask_widened_, false);
+  if (gpu_key_slots_.empty()) {
+    gpu_key_slots_.push_back(kUngradedSentinelKey);  // slot 0 -> key_slot 1
+    rescan_all = true;
+  }
+
+  const auto& lvram = video.latched_vram();
+  const auto& vram_tile_gen = video.latched_vram_tile_gen();
+  bool key_slots_changed = false;
+
+  auto scan_tiles = [&](bool full_pass) -> bool {
+    std::uint64_t idx_gen = 0u;
+    for (int ty = 0; ty < VesaPlanarVideo::kTilesY; ++ty) {
+      const int y0 = ty * kTile;
+      const int y1 = std::min(kH, y0 + kTile);
+      for (int tx = 0; tx < VesaPlanarVideo::kTilesX; ++tx) {
+        const auto tidx =
+            static_cast<std::size_t>(ty * VesaPlanarVideo::kTilesX + tx);
+        if (!full_pass && vram_tile_gen[tidx] == gpu_seen_vram_tile_gen_[tidx] &&
+            hd_canvas_tile_gen_[tidx] == gpu_seen_hd_tile_gen_[tidx]) {
+          continue;
+        }
+        gpu_seen_vram_tile_gen_[tidx] = vram_tile_gen[tidx];
+        gpu_seen_hd_tile_gen_[tidx] = hd_canvas_tile_gen_[tidx];
+
+        const int x0 = tx * kTile;
+        const int x1 = std::min(kW, x0 + kTile);
+        bool tile_changed = full_pass && (!gpu_was_active_ || force_full || cleared);
+
+        std::uint32_t prev_reg = 0u;
+        std::uint16_t prev_pal = 0u;
+        std::uint8_t prev_bank = 0u;
+        std::uint16_t prev_slot_1based = 0u;
+
+        for (int ly = y0; ly < y1; ++ly) {
+          std::size_t lidx =
+              static_cast<std::size_t>(ly) * kW + static_cast<std::size_t>(x0);
+          for (int lx = x0; lx < x1; ++lx, ++lidx) {
+            std::uint16_t slot_1based = 0u;
+            const std::uint32_t reg = hd_region_id_[lidx];
+            if (reg != 0u && lvram[lidx] == hd_snap_slot_[lidx]) {
+              const std::uint16_t pal = hd_ref_pal_id_[lidx];
+              const std::uint8_t bank = hd_bank_hint_[lidx];
+              if (pal >= ref_palettes_.size()) {
+                slot_1based = 1u;  // permanent ungraded slot
+              } else if (prev_slot_1based != 0u && reg == prev_reg &&
+                         pal == prev_pal && bank == prev_bank) {
+                slot_1based = prev_slot_1based;
+              } else {
+                const std::uint64_t key = grading_lut_key(
+                    pal, bank,
+                    effective_grading_mask(bank, region_used_mask_[reg]));
+                const auto it = gpu_key_to_slot_.find(key);
+                if (it != gpu_key_to_slot_.end()) {
+                  slot_1based = it->second;
+                } else if (gpu_key_slots_.size() < GpuHdInput::kMaxKeySlots) {
+                  slot_1based =
+                      static_cast<std::uint16_t>(gpu_key_slots_.size() + 1u);
+                  gpu_key_slots_.push_back(key);
+                  gpu_key_to_slot_.emplace(key, slot_1based);
+                  key_slots_changed = true;
+                } else if (!full_pass) {
+                  // Compact dead keys from overwritten sprites via full rescan.
+                  return false;
+                } else {
+                  slot_1based = 1u;  // >255 live distinct keys: ungraded fallback
+                }
+                prev_reg = reg;
+                prev_pal = pal;
+                prev_bank = bank;
+                prev_slot_1based = slot_1based;
+              }
+            }
+            if (gpu_lut_idx_map_[lidx] != slot_1based) {
+              gpu_lut_idx_map_[lidx] = slot_1based;
+              tile_changed = true;
+            }
+          }
+        }
+        if (tile_changed) {
+          if (idx_gen == 0u) {
+            idx_gen = ++gpu_lut_idx_gen_;
+          }
+          gpu_lut_idx_tile_gen_[tidx] = idx_gen;
+        }
+      }
+    }
+    return true;
+  };
+
+  if (rescan_all) {
+    if (force_full || !gpu_was_active_ || cleared) {
+      gpu_key_slots_.clear();
+      gpu_key_to_slot_.clear();
+      gpu_key_slots_.push_back(kUngradedSentinelKey);
+      key_slots_changed = true;
+    }
+    scan_tiles(true);
+  } else if (!scan_tiles(false)) {
+    // Reclaim dead key slots and rescan all tiles cleanly.
+    gpu_key_slots_.clear();
+    gpu_key_to_slot_.clear();
+    gpu_key_slots_.push_back(kUngradedSentinelKey);
+    key_slots_changed = true;
+    scan_tiles(true);
+  }
+
+  gpu_was_active_ = true;
+  resolve_gpu_luts(video, key_slots_changed || force_full);
+
+  out.active = true;
+  out.canvas_argb = hd_canvas_argb_.data();
+  out.canvas_tile_gen = hd_canvas_tile_gen_.data();
+  out.lut_idx_map = gpu_lut_idx_map_.data();
+  out.lut_idx_tile_gen = gpu_lut_idx_tile_gen_.data();
+  out.luts = gpu_luts_;
+  out.lut_slot_map = gpu_lut_slot_map_.data();
+  out.luts_gen = gpu_luts_gen_;
 }
 
 }  // namespace san4

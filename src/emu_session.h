@@ -10,6 +10,7 @@
 
 #include "frame_mailbox.h"
 #include "frame_profiler.h"
+#include "gpu/gpu_frame_mailbox.h"
 #include "host_channel.h"
 #include "machine.h"
 #include "render_policy.h"
@@ -77,6 +78,10 @@ class EmuSession {
   // rects in frame_rects(). Fills `upscale_ms`, `composite_ms` and
   // `dirty_tiles` of `row` when non-null.
   void produce_frame(bool& force_full, FrameProfileRow* row);
+  // GPU-pipeline variant: prepares HD metadata/LUTs without CPU upscaling or
+  // CPU 3200x2400 blending and publishes compact scene state to `mailbox`.
+  void produce_gpu_frame(bool& force_full, GpuFrameMailbox& mailbox,
+                         FrameProfileRow* row);
   std::span<const UpscaleDirtyRect> frame_rects() const { return frame_rects_; }
 
   HostStatus status() const;
@@ -92,6 +97,12 @@ class EmuSession {
   void run_loop(FrameMailbox& mailbox, HostCommandQueue& cmds,
                 const LoopOptions& opts, const std::atomic<bool>& stop);
 
+  // OpenGL 3.3 GPU-pipeline emulation-thread loop publishing to `GpuFrameMailbox`.
+  void run_gpu_loop(GpuFrameMailbox& mailbox, HostCommandQueue& cmds,
+                    const LoopOptions& opts);
+  void run_gpu_loop(GpuFrameMailbox& mailbox, HostCommandQueue& cmds,
+                    const LoopOptions& opts, const std::atomic<bool>& stop);
+
  private:
   void apply_mouse_motion(int x, int y);
 
@@ -101,6 +112,7 @@ class EmuSession {
   bool user_cycled_scale_ = false;
   bool drain_audio_ = false;
   bool quit_ = false;
+  bool gpu_hd_was_active_ = false;
   bool middle_dragging_ = false;
   int middle_drag_accum_x_ = 0;
   int middle_drag_accum_y_ = 0;
@@ -123,9 +135,12 @@ class EmuThread {
 
   void start(EmuSession& session, FrameMailbox& mailbox, HostCommandQueue& cmds,
              const EmuSession::LoopOptions& opts);
+  void start(EmuSession& session, GpuFrameMailbox& mailbox,
+             HostCommandQueue& cmds, const EmuSession::LoopOptions& opts);
   // Runs `body` instead of EmuSession::run_loop. When it returns or throws,
   // finished() becomes true and `mailbox` waiters are woken.
   void start(Body body, FrameMailbox& mailbox);
+  void start(Body body, GpuFrameMailbox& mailbox);
   bool running() const { return thread_.joinable(); }
   // True once the loop returned (Quit, guest exit, or an exception).
   bool finished() const { return finished_.load(std::memory_order_acquire); }

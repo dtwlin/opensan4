@@ -98,6 +98,17 @@ class VesaPlanarVideo {
   const std::array<std::uint8_t, kTileCount>& latched_glyph_tiles() const {
     return latched_glyph_tiles_;
   }
+  const std::array<std::uint64_t, kTileCount>& latched_vram_tile_gen()
+      const noexcept {
+    return latched_vram_tile_gen_;
+  }
+  const std::array<std::uint64_t, kTileCount>& latched_glyph_tile_gen()
+      const noexcept {
+    return latched_glyph_tile_gen_;
+  }
+  std::uint64_t latched_glyph_generation() const noexcept {
+    return latched_glyph_gen_;
+  }
   std::uint32_t palette_generation() const { return latched_palette_gen_; }
 
   // Consumes accumulated dirty tiles since the last upscale pass.
@@ -182,6 +193,12 @@ class VesaPlanarVideo {
   std::array<std::uint8_t, kTileCount> upscale_dirty_tiles_{};
   std::array<std::uint8_t, kTileCount> live_glyph_tiles_{};
   std::array<std::uint8_t, kTileCount> latched_glyph_tiles_{};
+  std::uint64_t live_vram_gen_ = 0;
+  std::array<std::uint64_t, kTileCount> latched_vram_tile_gen_{};
+  std::uint64_t live_glyph_gen_ = 0;
+  std::uint64_t latched_glyph_gen_ = 0;
+  std::array<std::uint64_t, kTileCount> live_glyph_tile_gen_{};
+  std::array<std::uint64_t, kTileCount> latched_glyph_tile_gen_{};
 
   std::array<std::uint32_t, 16> live_palette_argb_{};
   std::array<std::uint32_t, 16> latched_palette_argb_{};

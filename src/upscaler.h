@@ -66,6 +66,11 @@ class PixelUpscaler {
   UpscaleMode mode() const { return mode_; }
   UpscaleMode cycle_mode();
 
+  // When disabled (OpenGL GPU pipeline), set_mode() updates dimensions/mode
+  // without allocating the multi-megabyte CPU output canvas.
+  void set_canvas_enabled(bool enabled);
+  bool canvas_enabled() const noexcept { return canvas_enabled_; }
+
   static int scale_factor_for(UpscaleMode mode);
   static const char* mode_name(UpscaleMode mode);
   static bool parse_mode(std::string_view text, UpscaleMode& out_mode);
@@ -149,6 +154,7 @@ class PixelUpscaler {
 
   UpscaleMode mode_ = UpscaleMode::Sharp2x;
   bool mode_dirty_ = true;
+  bool canvas_enabled_ = true;
   int src_w_ = VesaPlanarVideo::kWidth;
   int src_h_ = VesaPlanarVideo::kHeight;
   int out_w_ = VesaPlanarVideo::kWidth * 2;

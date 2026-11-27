@@ -21,6 +21,7 @@
   - **極速啟動與嚴格記憶體上限**：啟動時僅需 `< 10 ms` 即可延遲載入 `hd_manifest.tsv` 與二進位索引表，無須預先解碼所有 PNG 圖檔；執行期間依需求串流解碼紋理至容量上限為 `256 MB` 的 LRU 快取中。
   - **`3200x2400` 螢幕空間 HD 畫布與硬體級精確遮擋**：支援無數量上限的同畫面 `16x16` HD 戰略／都市／野戰／攻城圖磚（`MAINCG.S4`、`TOSHICG.S4`、`HEXGRP.S4`、`HKGRP.S4`）、基於來源雜湊且帶透明遮罩的部隊／單挑／特效精靈圖（`HUNIT.S4`、`HIGRP.S4`、`HWGRP.S4`、`HEGRP.S4`）、`MONDATA.S4` 四部件動態組合武將頭像（由 `320` 個部件即時拼合 `8,192` 張臉孔）、`GRAPH.S4` 動態按鈕合成（`1,407` 個按鈕）、`tile_dict.bin` `16x16` 圖格動態合成、`AH=0x10`／`AH=0x18` 彈出視窗背景還原、支援重疊區域的 `AH=0x17` 地圖捲動複製、硬體級精確的 `vram_write8` 對話框遮擋判定，以及銳利平滑的 `4x` 反鋸齒 `.16P` Big5 繁體中文字型渲染（`AH=0x13`）。
   - **動態場景調色盤 CG 與平滑 3D LUT 色彩分級**：當動態調色盤 `NPK016` 插畫（`OPENDAT.S4`、`ENDDAT.S4`、`PREGRP.S4`、`HIBACK.S4`、`HEGRP.S4`）淡入完成時，自動升級為符合即時場景調色盤的高畫質圖層，並透過快取的 `17x17x17` 三線性內插 3D LUT 即時處理四季變化、戰場色調與平滑轉場色彩演繹。
+  - **OpenGL 3.3 Core 硬體 GPU 渲染管線與自動 CPU 備援機制**：在具備 OpenGL 3.3+ 硬體顯示卡（Linux 與 Windows 11 上之 NVIDIA、AMD、Intel GPU）的電腦上，`san4-linux`／`san4.exe` 會自動將全部 5 種基礎像素放大演算法（`nearest`、`sharp2x`、`scale2x`、`xbr2x`、`xbr4x`）、`3200x2400` HD 圖層合成以及 `17x17x17` 3D LUT 三線性色彩分級卸載至位元級精確的 GLSL `#version 330 core` 片段著色器執行——執行檔本身零靜態連結任何 OpenGL 函式庫（執行期透過 `SDL_GL_GetProcAddress` 動態載入），且在無硬體 GPU 或偵測到軟體光柵化驅動程式（`llvmpipe`、`softpipe`、`swrast`、`lavapipe`、`SVGA3D`、`GDI Generic`、`Microsoft Basic Render Driver`、`WARP`）時，會自動無縫退回多執行緒 CPU 搭配 `SDL_Renderer` 管線。
 - **流暢度、現代化操控與立體聲 OPL2 音效**：
   - 採用無節流 `6 ms` CPU 突發排程與靜止輸入／計時器輪詢偵測（待機 CPU 使用率 `< 2%`）、60–144 Hz 24 位元平滑淡入淡出轉場，以及不改變背景音樂速度的獨立遊戲加速功能（按 `F4` 切換 `1x / 2x / 4x`，或按住 `Tab` 鍵啟動 `16x` 極速快轉）。
   - 具備 `1:1` `800x600` 零延遲作業系統原生滑鼠追蹤與支援高 DPI 縮放的硬體彩色游標、滑鼠滾輪清單捲動、滑鼠中鍵拖曳／`WASD` 地圖平移，以及取樣精確的 `44.1 kHz` 立體聲 `DBOPL` YM3812 FM 音源合成。
@@ -74,7 +75,7 @@ ctest --test-dir build --output-on-failure
 
 ### 公開 CI／純引擎建置（無須遊戲檔案）
 
-專案貢獻者與 CI 執行環境無須擁有原版遊戲檔案，即可在開啟嚴格編譯警告（`-Wall -Wextra -Wpedantic -Werror`）下編譯 `san4-linux`、`san4-hdpack-gen` 與 `san4_tests`，並在 ASan + UBSan、ThreadSanitizer（TSan）以及 Clang `llvm-cov` 原始碼級別程式碼覆蓋率檢測下執行全部 `71` 組合成相容性、編解碼器、放大演算法、硬體模擬、並行處理、CLI／宿主環境、LTO／SIMD、安全性與二進位整潔度測試套件：
+專案貢獻者與 CI 執行環境無須擁有原版遊戲檔案，即可在開啟嚴格編譯警告（`-Wall -Wextra -Wpedantic -Werror`）下編譯 `san4-linux`、`san4-hdpack-gen` 與 `san4_tests`，並在 ASan + UBSan、ThreadSanitizer（TSan）以及 Clang `llvm-cov` 原始碼級別程式碼覆蓋率檢測下執行全部 `75` 組合成相容性、編解碼器、放大演算法、GPU 像素一致性、硬體模擬、並行處理、CLI／宿主環境、LTO／SIMD、安全性與二進位整潔度測試套件：
 
 ```bash
 # AddressSanitizer + UndefinedBehaviorSanitizer
@@ -233,7 +234,7 @@ cmake --build build-standalone -j
 - `--save-dir <DIR>`：將 `SAVEDAT.S4` 等存檔寫入獨立目錄，使 `--game-dir` 維持唯讀不變。
 - `--hd-pack <DIR>`／`--no-hd-pack`：啟用（或明確停用）32 位元 RGBA HD 高畫質素材包渲染。當啟用 `--hd-pack` 且未指定 `--scale` 時，預設採用 `xbr4x`（`3200x2400`）；但若偵測到處於軟體渲染器（CPU 光柵化）且可繪製區域高度不超過 `1440` 像素時，則預設採用 `xbr2x`（`1600x1200`，透過 `4x`→`2x` 超取樣保留 HD 細節）。在您手動按下 `F5` 切換模式前，調整視窗大小時皆會自動重新評估此項預設值。
 - `--scale <nearest|sharp2x|scale2x|xbr2x|xbr4x>`：選擇初始像素放大演算法（未啟用 HD 素材包時預設為 `sharp2x`；啟用 HD 素材包時之預設行為請參閱 `--hd-pack`）。明確傳入的 `--scale` 永遠優先套用。
-- `--renderer <auto|gpu|cpu>`：畫面呈現設定檔。`auto`（預設值）在 Windows 11 上會優先建立 `direct3d11` SDL 渲染器，在 Linux 上則優先建立 `opengles2` SDL 渲染器（若無則依序退回 SDL 預設渲染器與軟體渲染器）；當 SDL 回報為 `software` 驅動程式，或 `GL_RENDERER` 名稱包含 `llvmpipe`、`softpipe`、`swrast`、`SVGA3D` 時，會自動歸類為軟體設定檔。`gpu`／`cpu` 則可強制指定硬體或軟體設定檔。僅在硬體設定檔且螢幕更新率至少達 `55 Hz` 時才會啟用垂直同步（VSync）；其餘情況一律以 `60 Hz` 時間期限進行影格步調控制。啟動時會輸出一行診斷紀錄：`[san4-render] driver=<name> gl_renderer=<str> profile=<hw|sw> vsync=<0|1> scale=<mode> simd=<avx2|scalar>`（其中 `simd` 代表 HD 合成器所使用的指令集核心層級）。無頭模式則維持使用單純的 SDL 渲染器。
+- `--renderer <auto|gpu|cpu>`：渲染後端與畫面呈現設定檔。`auto`（預設值）在 Linux 與 Windows 11 上會自動探測 OpenGL 3.3 Core 環境（`GL_MAX_TEXTURE_SIZE >= 4096`），當確認為硬體 GPU 時即啟用雙階段 GLSL GPU 像素放大暨 HD／3D LUT 合成後端（`backend=opengl33`）；若系統不支援 OpenGL 3.3 或偵測到軟體光柵化驅動程式（`llvmpipe`、`softpipe`、`swrast`、`lavapipe`、`SVGA3D`、`GDI Generic`、`Microsoft Basic Render Driver`、`WARP`），則自動退回多執行緒 CPU 放大／合成器搭配 `SDL_Renderer`（`backend=sdl`，Windows 11 優先選用 `direct3d11`，Linux 優先選用 `opengles2`）。`gpu` 可強制請求 OpenGL 3.3 Core 後端（若不支援 OpenGL 3.3 則退回 `SDL_Renderer` 硬體設定檔）；`cpu` 則略過 OpenGL 探測並強制使用 CPU + `SDL_Renderer` 軟體設定檔。僅在硬體設定檔且螢幕更新率至少達 `55 Hz` 時才會啟用垂直同步（VSync）；其餘情況一律以 `60 Hz` 時間期限進行影格步調控制。啟動時會輸出一行診斷紀錄：`[san4-render] backend=<opengl33|sdl> driver=<name> gl_renderer=<str> profile=<hw|sw> vsync=<0|1> scale=<mode> simd=<avx2|scalar>`。無頭模式則維持使用單純的 SDL 渲染器。
 - `--window-scale <1..8>`：選擇初始 `4:3` 視窗縮放倍率（預設為 `2`，對應 `1600x1200`）。
 - `--speed <1|2|4>`：選擇初始遊戲進行速度倍率。
 - `--fullscreen`／`--windowed`：啟動時進入無邊框桌面全螢幕模式或視窗模式（預設為 `--windowed`）。

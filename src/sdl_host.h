@@ -10,6 +10,8 @@
 #include "emu_session.h"
 #include "frame_mailbox.h"
 #include "frame_profiler.h"
+#include "gpu/gl_renderer.h"
+#include "gpu/gpu_frame_mailbox.h"
 #include "host_channel.h"
 #include "machine.h"
 #include "present_tracker.h"
@@ -73,10 +75,17 @@ class SdlHost {
   };
 
   bool init_sdl();
+  // Probes an OpenGL 3.3 Core hardware GPU context on a hidden window first;
+  // destroys the probe window cleanly and returns false on software rasterizers
+  // (under `--renderer=auto`) or unsupported drivers so `init_sdl()` falls back
+  // to `SDL_Renderer`.
+  bool try_init_opengl_backend(const char* title, int win_w, int win_h,
+                               std::uint32_t base_win_flags, bool verbose_log);
   // Interactive renderer per the present policy (opengles2 first, profile,
   // VSync); logs one `[san4-render]` line when `verbose_log` is true.
   bool create_interactive_renderer(bool verbose_log = true);
   bool recreate_renderer_after_reset();
+  bool get_drawable_size(int& out_w, int& out_h) const;
   void open_audio_device(bool verbose_log);
   // Re-applies the automatic output scale for the current drawable size.
   void apply_auto_scale();
@@ -125,11 +134,13 @@ class SdlHost {
   std::uint64_t upload_rects(const std::uint32_t* argb,
                              std::span<const UpscaleDirtyRect> rects);
   void present_texture();
+  void present_gpu_texture();
   // Headless: produce, upload and present one frame on the calling thread.
   void render_and_present(bool& force_full_upscale);
   // Interactive: uploads what changed in `slot` since the last upload and
   // presents; returns whether a frame was presented.
   bool present_slot(const FrameMailbox::Slot& slot);
+  bool present_gpu_slot(const GpuFrameMailbox::Slot& slot);
   void step_headless_frames(int count, bool& running, bool& force_full);
   bool execute_headless_command(const std::vector<std::string>& parts,
                                 bool& running, bool& force_full);
@@ -151,6 +162,7 @@ class SdlHost {
 
   // Main <-> emulation thread channels.
   FrameMailbox mailbox_;
+  GpuFrameMailbox gpu_mailbox_;
   HostCommandQueue cmd_queue_;
   HostEventQueue event_queue_;
   std::vector<HostEvent> host_events_;
@@ -161,6 +173,9 @@ class SdlHost {
   SDL_Window* window_ = nullptr;
   SDL_Renderer* renderer_ = nullptr;
   SDL_Texture* texture_ = nullptr;
+  void* gl_context_ = nullptr;
+  std::unique_ptr<gpu::GlRenderer> gl_renderer_;
+  RenderBackendKind render_backend_ = RenderBackendKind::SdlRenderer;
   SDL_Cursor* color_cursor_ = nullptr;
   SDL_AudioDeviceID audio_dev_ = 0;
 

@@ -299,6 +299,22 @@ bool PixelUpscaler::parse_mode(std::string_view text, UpscaleMode& out_mode) {
   return false;
 }
 
+void PixelUpscaler::set_canvas_enabled(bool enabled) {
+  if (canvas_enabled_ == enabled) {
+    return;
+  }
+  canvas_enabled_ = enabled;
+  if (!canvas_enabled_) {
+    canvas_.clear();
+    canvas_.shrink_to_fit();
+  } else {
+    canvas_.assign(
+        static_cast<std::size_t>(out_w_) * static_cast<std::size_t>(out_h_),
+        0xFF000000u);
+    mode_dirty_ = true;
+  }
+}
+
 void PixelUpscaler::set_mode(UpscaleMode mode) {
   if (mode_ == mode && !mode_dirty_) {
     return;
@@ -307,7 +323,11 @@ void PixelUpscaler::set_mode(UpscaleMode mode) {
   const int s = scale_factor_for(mode_);
   out_w_ = src_w_ * s;
   out_h_ = src_h_ * s;
-  canvas_.assign(static_cast<std::size_t>(out_w_ * out_h_), 0xFF000000u);
+  if (canvas_enabled_) {
+    canvas_.assign(
+        static_cast<std::size_t>(out_w_) * static_cast<std::size_t>(out_h_),
+        0xFF000000u);
+  }
   mode_dirty_ = true;
 }
 
@@ -405,6 +425,11 @@ UpscaleDirtyRect PixelUpscaler::upscale_from_video(VesaPlanarVideo& video,
   const bool need_full = force_full || mode_dirty_ || palette_changed;
   if (!any_dirty && !need_full) {
     return rect;
+  }
+  const std::size_t needed_px =
+      static_cast<std::size_t>(out_w_) * static_cast<std::size_t>(out_h_);
+  if (canvas_.size() != needed_px) {
+    canvas_.assign(needed_px, 0xFF000000u);
   }
 
   const auto& pal = video.latched_palette_argb();
@@ -570,6 +595,12 @@ void PixelUpscaler::upscale_full_buffer(
     out_w_ = src_w_ * s;
     out_h_ = src_h_ * s;
     canvas_.assign(static_cast<std::size_t>(out_w_ * out_h_), 0xFF000000u);
+  } else {
+    const std::size_t needed_px =
+        static_cast<std::size_t>(out_w_) * static_cast<std::size_t>(out_h_);
+    if (canvas_.size() != needed_px) {
+      canvas_.assign(needed_px, 0xFF000000u);
+    }
   }
   rebuild_distance_lut(palette_argb);
   mode_dirty_ = false;

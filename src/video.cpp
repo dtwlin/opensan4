@@ -106,6 +106,8 @@ void VesaPlanarVideo::reset_mode(std::uint16_t mode) {
 
   shadow_vram_.fill(0);
   live_glyph_tiles_.fill(0);
+  ++live_glyph_gen_;
+  live_glyph_tile_gen_.fill(live_glyph_gen_);
   hd_occlude_bits_.fill(0u);
   hd_occlude_any_ = false;
   fade_active_ = false;
@@ -662,9 +664,17 @@ void VesaPlanarVideo::mark_glyph_rect(int x, int y, int w, int h) {
   const int ty0 = static_cast<int>(y0) >> 4;
   const int tx1 = static_cast<int>(x1 - 1) >> 4;
   const int ty1 = static_cast<int>(y1 - 1) >> 4;
+  std::uint64_t ggen = 0u;
   for (int ty = ty0; ty <= ty1; ++ty) {
     for (int tx = tx0; tx <= tx1; ++tx) {
-      live_glyph_tiles_[ty * kTilesX + tx] = 1u;
+      const int idx = ty * kTilesX + tx;
+      if (live_glyph_tiles_[idx] == 0u) {
+        if (ggen == 0u) {
+          ggen = ++live_glyph_gen_;
+        }
+        live_glyph_tiles_[idx] = 1u;
+        live_glyph_tile_gen_[idx] = ggen;
+      }
     }
   }
 }
@@ -686,14 +696,33 @@ void VesaPlanarVideo::clear_glyph_rect(int x, int y, int w, int h) {
   const int ty0 = static_cast<int>(y0) >> 4;
   const int tx1 = static_cast<int>(x1 - 1) >> 4;
   const int ty1 = static_cast<int>(y1 - 1) >> 4;
+  std::uint64_t ggen = 0u;
   for (int ty = ty0; ty <= ty1; ++ty) {
     for (int tx = tx0; tx <= tx1; ++tx) {
-      live_glyph_tiles_[ty * kTilesX + tx] = 0u;
+      const int idx = ty * kTilesX + tx;
+      if (live_glyph_tiles_[idx] != 0u) {
+        if (ggen == 0u) {
+          ggen = ++live_glyph_gen_;
+        }
+        live_glyph_tiles_[idx] = 0u;
+        live_glyph_tile_gen_[idx] = ggen;
+      }
     }
   }
 }
 
-void VesaPlanarVideo::clear_all_glyphs() { live_glyph_tiles_.fill(0u); }
+void VesaPlanarVideo::clear_all_glyphs() {
+  std::uint64_t ggen = 0u;
+  for (int i = 0; i < kTileCount; ++i) {
+    if (live_glyph_tiles_[i] != 0u) {
+      if (ggen == 0u) {
+        ggen = ++live_glyph_gen_;
+      }
+      live_glyph_tiles_[i] = 0u;
+      live_glyph_tile_gen_[i] = ggen;
+    }
+  }
+}
 
 void VesaPlanarVideo::mark_all_dirty() { live_dirty_tiles_.fill(1u); }
 
@@ -896,11 +925,14 @@ void VesaPlanarVideo::latch_frame() {
   if (!fade_active_) {
     const int cur_w = active_width();
     const int cur_h = active_height();
+    std::uint64_t vgen = 0u;
     if (latched_w_ != cur_w || latched_h_ != cur_h) {
       latched_w_ = cur_w;
       latched_h_ = cur_h;
       upscale_palette_changed_ = true;
       upscale_dirty_tiles_.fill(1u);
+      vgen = ++live_vram_gen_;
+      latched_vram_tile_gen_.fill(vgen);
     }
     for (int ty = 0; ty < kTilesY; ++ty) {
       for (int tx = 0; tx < kTilesX; ++tx) {
@@ -908,8 +940,12 @@ void VesaPlanarVideo::latch_frame() {
         if (!live_dirty_tiles_[tidx]) {
           continue;
         }
+        if (vgen == 0u) {
+          vgen = ++live_vram_gen_;
+        }
         live_dirty_tiles_[tidx] = 0u;
         upscale_dirty_tiles_[tidx] = 1u;
+        latched_vram_tile_gen_[tidx] = vgen;
 
         const int x0 = tx * kTileSize;
         const int y0 = ty * kTileSize;
@@ -921,7 +957,11 @@ void VesaPlanarVideo::latch_frame() {
         }
       }
     }
-    latched_glyph_tiles_ = live_glyph_tiles_;
+    if (latched_glyph_gen_ != live_glyph_gen_) {
+      latched_glyph_tiles_ = live_glyph_tiles_;
+      latched_glyph_tile_gen_ = live_glyph_tile_gen_;
+      latched_glyph_gen_ = live_glyph_gen_;
+    }
   }
 
   if (latched_palette_gen_ != live_palette_gen_) {

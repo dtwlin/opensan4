@@ -23,12 +23,39 @@ enum class RenderProfile : std::uint8_t {
   Software,
 };
 
+// Interactive host rendering backend.
+enum class RenderBackendKind : std::uint8_t {
+  SdlRenderer = 0,  // CPU upscaler + compositor -> SDL_Renderer
+  OpenGL33 = 1,     // OpenGL 3.3 Core GPU upscaler + HD/LUT compositor
+};
+
+struct GlCapabilities {
+  bool context_ok = false;
+  bool procs_ok = false;
+  int major_version = 0;
+  int minor_version = 0;
+  int max_texture_size = 0;
+  std::string_view gl_renderer;
+};
+
+inline constexpr int kMinOpenGlTextureSize = 4096;
+
 bool parse_renderer_preference(std::string_view text, RendererPreference& out);
 const char* render_profile_name(RenderProfile profile);  // "hw" or "sw"
+const char* render_backend_name(RenderBackendKind backend) noexcept;
 
 // True when `gl_renderer` (the `GL_RENDERER` string) names a CPU rasterizer:
-// llvmpipe, softpipe, swrast, or VMware SVGA3D (case-insensitive).
+// llvmpipe, softpipe, swrast, lavapipe, VMware SVGA3D, or Windows software
+// drivers (GDI Generic, Microsoft Basic Render Driver, WARP).
 bool is_software_gl_renderer(std::string_view gl_renderer);
+
+// Whether interactive startup should probe an OpenGL 3.3 Core GPU context.
+bool should_probe_opengl(RendererPreference pref, bool headless) noexcept;
+
+// Selects OpenGL 3.3 GPU shader backend when capabilities meet requirements
+// (and `gl_renderer` is hardware under `Auto`), else falls back to SdlRenderer.
+RenderBackendKind select_render_backend(RendererPreference pref,
+                                        const GlCapabilities& caps) noexcept;
 
 // `driver_name` is `SDL_RendererInfo::name`; `gl_renderer` is empty for non-GL
 // drivers.

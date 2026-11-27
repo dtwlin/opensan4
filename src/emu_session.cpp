@@ -180,6 +180,70 @@ void EmuSession::produce_frame(bool& force_full, FrameProfileRow* row) {
   }
 }
 
+void EmuSession::produce_gpu_frame(bool& force_full, GpuFrameMailbox& mailbox,
+                                   FrameProfileRow* row) {
+  machine_.hd_pack().prepare_frame(machine_.video());
+
+  std::array<std::uint8_t, VesaPlanarVideo::kTileCount> dirty{};
+  bool pal_changed = false;
+  machine_.video().consume_dirty_tiles(dirty, pal_changed);
+  const int active_w = machine_.video().latched_width();
+  const int active_h = machine_.video().latched_height();
+  const int tiles_x =
+      (active_w + VesaPlanarVideo::kTileSize - 1) / VesaPlanarVideo::kTileSize;
+  const int tiles_y =
+      (active_h + VesaPlanarVideo::kTileSize - 1) / VesaPlanarVideo::kTileSize;
+  int dirty_count = 0;
+  if (force_full) {
+    dirty_count = tiles_x * tiles_y;
+  } else {
+    for (int ty = 0; ty < tiles_y; ++ty) {
+      const int row_base = ty * VesaPlanarVideo::kTilesX;
+      for (int tx = 0; tx < tiles_x; ++tx) {
+        if (dirty[static_cast<std::size_t>(row_base + tx)] != 0u) {
+          ++dirty_count;
+        }
+      }
+    }
+  }
+
+  FrameProfiler::Clock::time_point t_composite0;
+  if (row != nullptr) {
+    t_composite0 = FrameProfiler::Clock::now();
+  }
+  GpuHdInput gpu_hd{};
+  const HdPackManager& hd = machine_.hd_pack();
+  if (hd.active_overlay_count() > 0u || hd.has_pending_hd_changes() ||
+      gpu_hd_was_active_) {
+    hd.prepare_gpu_composite_state(machine_.video(), force_full, gpu_hd);
+  }
+  gpu_hd_was_active_ = gpu_hd.active;
+
+  if (row != nullptr) {
+    row->upscale_ms = 0.0;
+    row->composite_ms =
+        FrameProfiler::ms_between(t_composite0, FrameProfiler::Clock::now());
+    row->dirty_tiles = dirty_count;
+  }
+
+  const VesaPlanarVideo& vid = machine_.video();
+  const GpuVideoInput gpu_vid{
+      .src_w = active_w,
+      .src_h = active_h,
+      .mode = upscaler_.mode(),
+      .vram = vid.latched_vram().data(),
+      .vram_tile_gen = vid.latched_vram_tile_gen().data(),
+      .palette_argb = &vid.latched_palette_argb(),
+      .palette_gen = vid.palette_generation(),
+      .glyph_tiles = vid.latched_glyph_tiles().data(),
+      .glyph_tile_gen = vid.latched_glyph_tile_gen().data(),
+      .glyph_gen = vid.latched_glyph_generation(),
+  };
+  mailbox.publish(gpu_vid, gpu_hd, force_full, status(),
+                  row != nullptr ? *row : FrameProfileRow{});
+  force_full = false;
+}
+
 HostStatus EmuSession::status() const {
   return HostStatus{
       .mode = upscaler_.mode(),
@@ -263,6 +327,71 @@ void EmuSession::run_loop(FrameMailbox& mailbox, HostCommandQueue& cmds,
   }
 }
 
+void EmuSession::run_gpu_loop(GpuFrameMailbox& mailbox, HostCommandQueue& cmds,
+                              const LoopOptions& opts) {
+  const std::atomic<bool> never_stop{false};
+  run_gpu_loop(mailbox, cmds, opts, never_stop);
+}
+
+void EmuSession::run_gpu_loop(GpuFrameMailbox& mailbox, HostCommandQueue& cmds,
+                              const LoopOptions& opts,
+                              const std::atomic<bool>& stop) {
+  using Clock = std::chrono::steady_clock;
+  const auto tick = std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double>(kFrameSec));
+  const auto min_frame = std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double>(kMinFrameSec));
+  bool force_full = true;
+  drain_audio_ = opts.drain_audio;
+  std::vector<HostCmd> batch;
+  auto prev = Clock::now();
+  auto next_tick = prev + tick;
+
+  while (true) {
+    const auto start = Clock::now();
+    const double dt = std::clamp(
+        std::chrono::duration<double>(start - prev).count(), kMinFrameSec,
+        kMaxFrameSec);
+    prev = start;
+
+    cmds.drain(batch);
+    for (const HostCmd& cmd : batch) {
+      apply(cmd);
+    }
+    if (stop.load(std::memory_order_acquire)) {
+      quit_ = true;
+    }
+    if (quit_) {
+      return;
+    }
+
+    FrameProfileRow row{};
+    FrameProfileRow* const row_ptr = opts.profiling ? &row : nullptr;
+    run_guest_frame(dt, opts.guest_budget_sec, row_ptr);
+    produce_gpu_frame(force_full, mailbox, row_ptr);
+    if (drain_audio_) {
+      discard_buffered_audio(machine_.audio());
+    }
+    if (machine_.exited()) {
+      return;
+    }
+
+    const auto now = Clock::now();
+    if (machine_.effective_speed_multiplier() > 1) {
+      std::this_thread::sleep_until(start + min_frame);
+      next_tick = Clock::now() + tick;
+      continue;
+    }
+    if (now < next_tick) {
+      std::this_thread::sleep_until(next_tick);
+    }
+    next_tick += tick;
+    if (next_tick < now) {
+      next_tick = now + tick;
+    }
+  }
+}
+
 EmuThread::~EmuThread() { shutdown(); }
 
 void EmuThread::start(EmuSession& session, FrameMailbox& mailbox,
@@ -275,7 +404,32 @@ void EmuThread::start(EmuSession& session, FrameMailbox& mailbox,
       mailbox);
 }
 
+void EmuThread::start(EmuSession& session, GpuFrameMailbox& mailbox,
+                      HostCommandQueue& cmds,
+                      const EmuSession::LoopOptions& opts) {
+  start(
+      [&session, &mailbox, &cmds, opts](const std::atomic<bool>& stop) {
+        session.run_gpu_loop(mailbox, cmds, opts, stop);
+      },
+      mailbox);
+}
+
 void EmuThread::start(Body body, FrameMailbox& mailbox) {
+  stop_requested_.store(false, std::memory_order_release);
+  finished_.store(false, std::memory_order_release);
+  error_ = nullptr;
+  thread_ = std::thread([this, body = std::move(body), &mailbox] {
+    try {
+      body(stop_requested_);
+    } catch (...) {
+      error_ = std::current_exception();
+    }
+    finished_.store(true, std::memory_order_release);
+    mailbox.notify_waiters();
+  });
+}
+
+void EmuThread::start(Body body, GpuFrameMailbox& mailbox) {
   stop_requested_.store(false, std::memory_order_release);
   finished_.store(false, std::memory_order_release);
   error_ = nullptr;
